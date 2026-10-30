@@ -29,8 +29,8 @@ export default function WeddingBudget() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="My Wedding Contribution"
-        subtitle={<>My personal share of the wedding on {fmtDate(data.profile.weddingDate, true)} — separate from the overall budget shared with family.</>}
+        title="Our Wedding 2027 – My Contribution"
+        subtitle={<>Only my personal share of the wedding on {fmtDate(data.profile.weddingDate, true)}. It is not combined with my partner’s or family’s money.</>}
         actions={<><Button variant="secondary" onClick={exportCSV}>Export CSV</Button><Button onClick={() => setEdit({ id: '', name: '', planned: 0, dueDate: '', notes: '', receipts: '' })}>Add category</Button></>}
       />
 
@@ -40,16 +40,16 @@ export default function WeddingBudget() {
           <NumberField label="Overall shared wedding budget (for reference)" prefix="₹" value={data.wedding.overallSharedBudget} onChange={(v) => update((d) => { d.wedding.overallSharedBudget = v })} hint="Not used in your calculations." />
         </div>
         <div className="mt-5 grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          <Stat label="Total personal budget" value={money(wedding.target)} />
-          <Stat label="Paid so far" value={money(wedding.paid)} />
-          <Stat label="Budget remaining" value={money(wedding.remainingBudget)} />
-          <Stat label="Saved for wedding" value={money(wedding.saved)} sub="In wedding savings accounts" />
-          <Stat label="Still to save" value={money(wedding.remainingToSave)} tone={wedding.target > 0 && wedding.remainingToSave === 0 ? 'green' : undefined} />
-          <Stat label="Savings progress" value={pct(wedding.progress)} sub="(Saved + paid) ÷ budget" />
+          <Stat label="My total wedding budget" value={money(wedding.target)} />
+          <Stat label="Total paid" value={money(wedding.paid)} />
+          <Stat label="Unpaid commitments" value={money(wedding.unpaidCommitments)} sub="Planned − paid, by category" />
+          <Stat label="Wedding savings available" value={money(wedding.saved)} sub="In wedding savings accounts" />
+          <Stat label="Remaining savings required" value={money(wedding.remainingToSave)} tone={wedding.target > 0 && wedding.remainingToSave === 0 ? 'green' : undefined} sub="Budget − paid − saved" />
+          <Stat label="Budget completion" value={pct(wedding.budgetCompletion)} sub={`Paid ÷ budget · funded ${pct(wedding.progress)}`} />
         </div>
         <div className="mt-4"><Progress value={wedding.funded} max={wedding.target} tone="gold" label="Wedding savings progress" showLabel={false} /></div>
         <p className="mt-2 text-xs text-slate-500">
-          Payments are recorded once, in the Money Tracker, and linked to a category here. That way a payment counts as an expense and as paid, but is never counted twice. Emergency savings are never included.
+          A payment is recorded once (in the Money Tracker, or with “Record payment” here) and linked to a category, so it counts as an expense and as paid — never twice. Emergency savings are never included.
         </p>
       </Card>
 

@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useData } from './store'
 import { todayISO } from './dates'
-import { calcJob } from './calc/job'
-import { planWeddingLeave, summariseLeaveYear } from './calc/leave'
-import { accountBalances, calcWedding, upcomingExpenses } from './calc/finance'
+import { calcEmployment } from './calc/employment'
+import { planWeddingLeave, summariseLeave } from './calc/leave'
+import { accountBalances, calcWedding, salarySchedule, totalUpcoming, upcomingPayments } from './calc/finance'
 import { calcSavings } from './calc/savings'
 import { buildReminders } from './calc/reminders'
 
@@ -21,14 +21,18 @@ export function usePlanner() {
   const data = useData()
   const today = useToday()
   return useMemo(() => {
-    const job = calcJob(data.job, data.profile.weddingDate, data.leavePolicy.holidays, data.leavePolicy.weekendDays, today)
-    const leave = summariseLeaveYear(data.leaves, data.leavePolicy, today)
-    const weddingLeave = planWeddingLeave(data.leaves, data.leavePolicy, job.lastWorkingDay, today)
+    const lp = data.leavePolicy
+    const emp = calcEmployment(data.employment, data.resignation, data.milestones, data.profile.weddingDate, lp.holidays, lp.weekendDays, today)
+    const lastDay = data.employment.targetLastDay
+    const leave = summariseLeave(data.leaves, lp, data.employment.joiningDate, today)
+    const weddingLeave = planWeddingLeave(data.leaves, lp, data.employment.joiningDate, lastDay, today)
     const wedding = calcWedding(data, today)
     const balances = accountBalances(data, today)
-    const savings = calcSavings(data, job.lastWorkingDay, today)
-    const upcoming = upcomingExpenses(data, wedding, today)
-    const reminders = buildReminders(data, job, today)
-    return { data, today, job, leave, weddingLeave, wedding, balances, savings, upcoming, reminders }
+    const savings = calcSavings(data, lastDay, today)
+    const upcoming = upcomingPayments(data, wedding, today)
+    const commitments = totalUpcoming(data, wedding, today)
+    const salary = salarySchedule(data, lastDay, today)
+    const reminders = buildReminders(data, emp, today)
+    return { data, today, emp, leave, weddingLeave, wedding, balances, savings, upcoming, commitments, salary, reminders }
   }, [data, today])
 }

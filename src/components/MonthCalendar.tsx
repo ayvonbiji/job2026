@@ -1,32 +1,25 @@
 import { useState } from 'react'
+import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { addMonthKey, DAY_NAMES, fmtMonth, monthKey, parseISO, toISO } from '../lib/dates'
+import type { CalEvent, CalKind } from '../lib/calc/reminders'
 import { Button, cx } from './ui'
 
-export type CalKind = 'annual' | 'pending' | 'planned' | 'sick' | 'unpaid' | 'other' | 'holiday' | 'reminder' | 'wedding'
-
-export interface CalEvent {
-  date: string
-  label: string
-  kind: CalKind
-  half?: boolean
-}
-
 const kindStyle: Record<CalKind, { chip: string; legend: string }> = {
-  annual: { chip: 'bg-navy-700 text-white', legend: 'Annual leave (approved/taken)' },
-  pending: { chip: 'bg-amber-100 text-amber-900 ring-1 ring-amber-300', legend: 'Pending request' },
-  planned: { chip: 'bg-gold-50 text-gold-700 ring-1 ring-dashed ring-gold-300', legend: 'Planned (not requested)' },
-  sick: { chip: 'bg-rose-100 text-rose-900', legend: 'Sick leave' },
-  unpaid: { chip: 'bg-slate-200 text-slate-800', legend: 'Unpaid leave' },
-  other: { chip: 'bg-navy-100 text-navy-800', legend: 'Other leave' },
-  holiday: { chip: 'bg-emerald-100 text-emerald-900', legend: 'Company holiday' },
-  reminder: { chip: 'bg-white text-navy-800 ring-1 ring-cream-300', legend: 'Reminder' },
+  salary: { chip: 'bg-emerald-50 text-emerald-900 ring-1 ring-dashed ring-emerald-300', legend: 'Salary due' },
+  salaryPaid: { chip: 'bg-emerald-600 text-white', legend: 'Salary received' },
+  expense: { chip: 'bg-slate-200 text-slate-800', legend: 'Rent, bills & expenses' },
   wedding: { chip: 'bg-gold-500 text-white', legend: 'Wedding' },
+  savings: { chip: 'bg-navy-100 text-navy-800', legend: 'Savings' },
+  leave: { chip: 'bg-navy-700 text-white', legend: 'Leave (approved/taken)' },
+  leavePending: { chip: 'bg-amber-100 text-amber-900 ring-1 ring-amber-300', legend: 'Leave (planned/pending)' },
+  holiday: { chip: 'bg-rose-100 text-rose-900', legend: 'Holiday' },
+  job: { chip: 'bg-white text-navy-800 ring-1 ring-navy-300', legend: 'Employment' },
+  reminder: { chip: 'bg-white text-slate-700 ring-1 ring-cream-300', legend: 'Reminder' },
 }
 
-export default function MonthCalendar({ events, weekendDays, today, initialMonth }: { events: CalEvent[]; weekendDays: number[]; today: string; initialMonth?: string }) {
-  const [month, setMonth] = useState(initialMonth ?? monthKey(today))
+export default function MonthCalendar({ events, weekendDays, today, onSelectDate, selected }: { events: CalEvent[]; weekendDays: number[]; today: string; onSelectDate?: (d: string) => void; selected?: string }) {
+  const [month, setMonth] = useState(monthKey(today))
   const first = parseISO(`${month}-01`)
-  // Monday-first grid
   const offset = (first.getDay() + 6) % 7
   const start = new Date(first)
   start.setDate(1 - offset)
@@ -45,12 +38,12 @@ export default function MonthCalendar({ events, weekendDays, today, initialMonth
   return (
     <div>
       <div className="mb-3 flex items-center justify-between">
-        <Button variant="secondary" size="sm" onClick={() => setMonth(addMonthKey(month, -1))} aria-label="Previous month">‹ Prev</Button>
+        <Button variant="secondary" size="sm" onClick={() => setMonth(addMonthKey(month, -1))} aria-label="Previous month"><ChevronLeft className="h-4 w-4" aria-hidden /></Button>
         <div className="flex items-center gap-2">
           <h3 className="font-semibold text-navy-900" aria-live="polite">{fmtMonth(month)}</h3>
           {month !== monthKey(today) && <Button variant="ghost" size="sm" onClick={() => setMonth(monthKey(today))}>Today</Button>}
         </div>
-        <Button variant="secondary" size="sm" onClick={() => setMonth(addMonthKey(month, 1))} aria-label="Next month">Next ›</Button>
+        <Button variant="secondary" size="sm" onClick={() => setMonth(addMonthKey(month, 1))} aria-label="Next month"><ChevronRight className="h-4 w-4" aria-hidden /></Button>
       </div>
       <div className="grid grid-cols-7 gap-px overflow-hidden rounded-xl border border-cream-200 bg-cream-200 text-xs" role="grid" aria-label={`Calendar for ${fmtMonth(month)}`}>
         {order.map((d) => (
@@ -61,8 +54,17 @@ export default function MonthCalendar({ events, weekendDays, today, initialMonth
           const evs = byDate.get(c) ?? []
           const weekend = weekendDays.includes(parseISO(c).getDay())
           const label = `${c}${evs.length ? ': ' + evs.map((e) => e.label).join(', ') : ''}`
+          const Tag = onSelectDate ? 'button' : 'div'
           return (
-            <div key={c} role="gridcell" aria-label={label} className={cx('min-h-[64px] p-1 sm:min-h-[84px]', inMonth ? (weekend ? 'bg-cream-50' : 'bg-white') : 'bg-cream-100/60 text-slate-400')}>
+            <Tag
+              key={c}
+              type={onSelectDate ? 'button' : undefined}
+              role="gridcell"
+              aria-label={label}
+              aria-selected={selected === c || undefined}
+              onClick={onSelectDate ? () => onSelectDate(c) : undefined}
+              className={cx('min-h-[64px] p-1 text-left align-top sm:min-h-[88px]', inMonth ? (weekend ? 'bg-cream-50' : 'bg-white') : 'bg-cream-100/60 text-slate-400', selected === c && 'ring-2 ring-inset ring-gold-300')}
+            >
               <div className={cx('mb-0.5 flex h-5 w-5 items-center justify-center rounded-full text-[11px]', c === today ? 'bg-gold-500 font-bold text-white' : 'text-slate-600')}>{Number(c.slice(8))}</div>
               <div className="space-y-0.5">
                 {evs.slice(0, 3).map((e, i) => (
@@ -72,7 +74,7 @@ export default function MonthCalendar({ events, weekendDays, today, initialMonth
                 ))}
                 {evs.length > 3 && <div className="text-[10px] text-slate-500">+{evs.length - 3} more</div>}
               </div>
-            </div>
+            </Tag>
           )
         })}
       </div>

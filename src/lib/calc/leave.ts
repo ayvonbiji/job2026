@@ -1,26 +1,31 @@
-import type { ISODate, LeaveEntry, LeavePolicy } from '../types'
-import { addDays, dayOfWeek, fmtDate, isValidISO, todayISO } from '../dates'
-import { periodEnd } from './job'
+import type { BalancedLeave, ISODate, LeaveEntry, LeavePolicy, LeaveType } from '../types'
+import { addDays, dayOfWeek, fmtDate, isValidISO, monthKey, monthsBetweenKeys, todayISO } from '../dates'
 
 export interface LeaveDay {
   date: ISODate
-  amount: number // 1 or 0.5
+  amount: number
 }
+
+type CountPolicy = Pick<LeavePolicy, 'weekendDays' | 'holidays' | 'dayCountRule'>
 
 export function isWorkingDay(date: ISODate, policy: Pick<LeavePolicy, 'weekendDays' | 'holidays'>): boolean {
   if (policy.weekendDays.includes(dayOfWeek(date))) return false
   return !policy.holidays.some((h) => h.date === date)
 }
 
-/** Working days covered by a leave entry, excluding weekends and company holidays. Half days count as 0.5. */
-export function leaveDays(entry: Pick<LeaveEntry, 'startDate' | 'endDate' | 'startHalf' | 'endHalf'>, policy: Pick<LeavePolicy, 'weekendDays' | 'holidays'>): LeaveDay[] {
+/**
+ * Days covered by a leave entry, using the configured counting rule.
+ * 'calendar' counts every day (default — no weekend rule is assumed);
+ * 'working' skips configured weekend days and company holidays.
+ */
+export function leaveDays(entry: Pick<LeaveEntry, 'startDate' | 'endDate' | 'startHalf' | 'endHalf'>, policy: CountPolicy): LeaveDay[] {
   if (!isValidISO(entry.startDate)) return []
   const end = isValidISO(entry.endDate) && entry.endDate >= entry.startDate ? entry.endDate : entry.startDate
   const out: LeaveDay[] = []
   let d = entry.startDate
   let guard = 0
   while (d <= end && guard++ < 400) {
-    if (isWorkingDay(d, policy)) {
+    if (policy.dayCountRule === 'calendar' || isWorkingDay(d, policy)) {
       let amount = 1
       if (d === entry.startDate && entry.startHalf) amount = 0.5
       else if (d === end && end !== entry.startDate && entry.endHalf) amount = 0.5
@@ -31,154 +36,152 @@ export function leaveDays(entry: Pick<LeaveEntry, 'startDate' | 'endDate' | 'sta
   return out
 }
 
-export function countLeaveDays(entry: LeaveEntry, policy: LeavePolicy): number {
+export function calculatedDays(entry: LeaveEntry, policy: CountPolicy): number {
   return leaveDays(entry, policy).reduce((s, x) => s + x.amount, 0)
+}
+
+/** Days recorded for the entry: your manual figure if entered, otherwise the calculated figure. */
+export function countLeaveDays(entry: LeaveEntry, policy: CountPolicy): number {
+  return entry.days !== null && Number.isFinite(entry.days) ? entry.days : calculatedDays(entry, policy)
+}
+
+/** Day-by-day allocation used for date ranges. A manual figure is counted on the start date. */
+function allocation(entry: LeaveEntry, policy: CountPolicy): LeaveDay[] {
+  if (entry.days !== null && Number.isFinite(entry.days)) return [{ date: entry.startDate, amount: entry.days }]
+  return leaveDays(entry, policy)
 }
 
 export function leaveYearFor(date: ISODate, startMonth: number): { start: ISODate; end: ISODate } {
   const [y, m] = date.split('-').map(Number)
   const year = m >= startMonth ? y : y - 1
   const start = `${year}-${String(startMonth).padStart(2, '0')}-01`
-  return { start, end: periodEnd(start, 12) }
+  return { start, end: addDays(`${year + 1}-${String(startMonth).padStart(2, '0')}-01`, -1) }
 }
 
-const ACTIVE: LeaveEntry['status'][] = ['Planned', 'Pending', 'Approved', 'Taken']
+function sumIn(entries: LeaveEntry[], policy: CountPolicy, from: ISODate, to: ISODate, pick: (e: LeaveEntry, d: ISODate) => boolean): number {
+  let total = 0
+  for (const e of entries) for (const day of allocation(e, policy)) if (day.date >= from && day.date <= to && pick(e, day.date)) total += day.amount
+  return total
+}
 
-export interface LeaveYearSummary {
-  start: ISODate
-  end: ISODate
-  entitlement: number
+export interface TypeSummary {
+  type: LeaveType
+  annual: number
+  accruedToDate: number // entitlement counted now (after the accrual rule)
   carryoverCounted: number
   carryoverUnconfirmed: number
   used: number
   approvedUpcoming: number
   pending: number
   planned: number
-  available: number // entitlement + confirmed carryover − used
-  afterApproved: number // available − approved upcoming
-  projected: number // afterApproved − pending − planned
-  sickUsed: number
-  sickRemaining: number
-  unpaid: number
-  other: number
+  available: number
+  afterApproved: number
+  projected: number
 }
 
-function sumInRange(entries: LeaveEntry[], policy: LeavePolicy, from: ISODate, to: ISODate, pick: (e: LeaveEntry, d: ISODate) => boolean): number {
-  let total = 0
-  for (const e of entries) {
-    for (const day of leaveDays(e, policy)) {
-      if (day.date >= from && day.date <= to && pick(e, day.date)) total += day.amount
+export interface LeaveSummary {
+  start: ISODate
+  end: ISODate
+  byType: Record<BalancedLeave, TypeSummary>
+  loa: { taken: number; upcoming: number; pending: number }
+  notes: string[]
+}
+
+const isUsed = (e: LeaveEntry, d: ISODate, today: ISODate) => e.status === 'Taken' || (e.status === 'Approved' && d <= today)
+
+export function summariseLeave(entries: LeaveEntry[], policy: LeavePolicy, joiningDate: ISODate, today = todayISO()): LeaveSummary {
+  const { start, end } = leaveYearFor(today, policy.leaveYearStartMonth)
+  const notes: string[] = []
+  const byType = {} as Record<BalancedLeave, TypeSummary>
+  for (const type of ['CL', 'SL', 'Comp'] as BalancedLeave[]) {
+    const ent = policy.entitlements[type]
+    const list = entries.filter((e) => e.type === type)
+    let accruedToDate = ent.annualDays
+    if (type !== 'Comp' && policy.accrual === 'Monthly') {
+      const from = isValidISO(joiningDate) && joiningDate > start ? monthKey(joiningDate) : monthKey(start)
+      const months = Math.max(0, Math.min(12, monthsBetweenKeys(from, monthKey(today)) + 1))
+      accruedToDate = Math.round(((ent.annualDays * months) / 12) * 2) / 2
+    }
+    const usedTracked = sumIn(list, policy, start, end, (e, d) => isUsed(e, d, today))
+    const used = ent.usedBeforeTracking + usedTracked
+    const approvedUpcoming = sumIn(list, policy, start, end, (e, d) => e.status === 'Approved' && d > today)
+    const pending = sumIn(list, policy, start, end, (e) => e.status === 'Pending')
+    const planned = sumIn(list, policy, start, end, (e) => e.status === 'Planned')
+    const carryoverCounted = ent.carryoverConfirmed ? ent.carryover : 0
+    const available = accruedToDate + carryoverCounted - used
+    byType[type] = {
+      type,
+      annual: ent.annualDays,
+      accruedToDate,
+      carryoverCounted,
+      carryoverUnconfirmed: ent.carryoverConfirmed ? 0 : ent.carryover,
+      used,
+      approvedUpcoming,
+      pending,
+      planned,
+      available,
+      afterApproved: available - approvedUpcoming,
+      projected: available - approvedUpcoming - pending - planned,
     }
   }
-  return total
-}
-
-export function summariseLeaveYear(entries: LeaveEntry[], policy: LeavePolicy, today = todayISO()): LeaveYearSummary {
-  const { start, end } = leaveYearFor(today, policy.leaveYearStartMonth)
-  const annual = entries.filter((e) => e.type === 'Annual')
-  const usedTracked = sumInRange(annual, policy, start, end, (e, d) => e.status === 'Taken' || (e.status === 'Approved' && d <= today))
-  const approvedUpcoming = sumInRange(annual, policy, start, end, (e, d) => e.status === 'Approved' && d > today)
-  const pending = sumInRange(annual, policy, start, end, (e) => e.status === 'Pending')
-  const planned = sumInRange(annual, policy, start, end, (e) => e.status === 'Planned')
-  const used = policy.usedBeforeTracking + usedTracked
-  const carryoverCounted = policy.carryoverConfirmedByHr ? policy.carryover : 0
-  const available = policy.annualEntitlement + carryoverCounted - used
-  const afterApproved = available - approvedUpcoming
-  const projected = afterApproved - pending - planned
-  const sickUsed = sumInRange(entries.filter((e) => e.type === 'Sick'), policy, start, end, (e) => e.status === 'Taken' || e.status === 'Approved')
-  const unpaid = sumInRange(entries.filter((e) => e.type === 'Unpaid'), policy, start, end, (e) => e.status === 'Taken' || e.status === 'Approved')
-  const other = sumInRange(entries.filter((e) => e.type === 'Other'), policy, start, end, (e) => e.status === 'Taken' || e.status === 'Approved')
-  return {
-    start,
-    end,
-    entitlement: policy.annualEntitlement,
-    carryoverCounted,
-    carryoverUnconfirmed: policy.carryoverConfirmedByHr ? 0 : policy.carryover,
-    used,
-    approvedUpcoming,
-    pending,
-    planned,
-    available,
-    afterApproved,
-    projected,
-    sickUsed,
-    sickRemaining: policy.sickEntitlement - sickUsed,
-    unpaid,
-    other,
+  const loaList = entries.filter((e) => e.type === 'LOA')
+  const loa = {
+    taken: sumIn(loaList, policy, start, end, (e, d) => isUsed(e, d, today)),
+    upcoming: sumIn(loaList, policy, start, end, (e, d) => e.status === 'Approved' && d > today),
+    pending: sumIn(loaList, policy, start, end, (e) => e.status === 'Pending' || e.status === 'Planned'),
   }
+  if (policy.accrual === 'Not confirmed') notes.push('HR has not confirmed how leave is credited (all at once or monthly). Balances show your full entitlement until you record the rule.')
+  return { start, end, byType, loa, notes }
 }
 
 export interface WeddingLeavePlan {
   lastWorkingDay: ISODate
   exitInCurrentYear: boolean
-  currentYearLeft: number // projected balance this leave year
+  currentYearCL: number
   nextYearStart: ISODate
-  nextYearAvailable: number // HR-confirmed entitlement before exit − leave already booked in that period
-  nextYearBooked: number
-  totalBeforeExit: number
+  nextYearCLBooked: number
+  nextYearCL: number
+  totalCLBeforeExit: number
   weddingLeaveBooked: number
-  workingDaysToExit: number
-  mayLapse: number // days at risk of being lost at the end of this leave year
+  mayLapse: number
   notes: string[]
 }
 
-export function planWeddingLeave(entries: LeaveEntry[], policy: LeavePolicy, lastWorkingDay: ISODate, today = todayISO()): WeddingLeavePlan {
-  const cur = summariseLeaveYear(entries, policy, today)
+export function planWeddingLeave(entries: LeaveEntry[], policy: LeavePolicy, joiningDate: ISODate, lastWorkingDay: ISODate, today = todayISO()): WeddingLeavePlan {
+  const cur = summariseLeave(entries, policy, joiningDate, today)
   const notes: string[] = []
   const exit = isValidISO(lastWorkingDay) ? lastWorkingDay : ''
   const exitInCurrentYear = !exit || exit <= cur.end
   const nextYearStart = addDays(cur.end, 1)
-  let nextYearBooked = 0
-  let nextYearAvailable = 0
+  const active = (e: LeaveEntry) => ['Planned', 'Pending', 'Approved', 'Taken'].includes(e.status)
+  let nextYearCLBooked = 0
+  let nextYearCL = 0
   if (exit && !exitInCurrentYear) {
-    nextYearBooked = sumInRange(
-      entries.filter((e) => e.type === 'Annual'),
-      policy,
-      nextYearStart,
-      exit,
-      (e) => ACTIVE.includes(e.status),
-    )
-    nextYearAvailable = policy.nextYearEntitlementBeforeExit - nextYearBooked
-    if (policy.nextYearEntitlementBeforeExit === 0) {
-      notes.push('Enter the leave HR confirms you will get in the next leave year up to your last working day. Many companies pro-rate it when you resign.')
-    }
+    nextYearCLBooked = sumIn(entries.filter((e) => e.type === 'CL'), policy, nextYearStart, exit, active)
+    nextYearCL = policy.nextYearCLBeforeExit - nextYearCLBooked
+    if (policy.nextYearCLBeforeExit === 0) notes.push(`Ask HR how much CL you will have from ${fmtDate(nextYearStart)} until your last working day, then enter it below.`)
   }
-  const weddingLeaveBooked = sumInRange(
-    entries.filter((e) => e.forWedding),
-    policy,
-    '0000-01-01',
-    '9999-12-31',
-    (e) => ACTIVE.includes(e.status),
-  )
-  let workingDaysToExit = 0
-  if (exit && exit >= today) {
-    workingDaysToExit = leaveDays({ startDate: today, endDate: exit, startHalf: false, endHalf: false }, policy).length
-  }
-  const confirmedCarry = policy.nextYearCarryoverConfirmed ? policy.nextYearCarryover : 0
-  const mayLapse = !exitInCurrentYear ? Math.max(0, cur.projected - confirmedCarry) : 0
-  if (mayLapse > 0) {
-    notes.push(`${mayLapse} day(s) of this year's leave may be lost after ${fmtDate(cur.end)} unless you use them or HR confirms they carry over.`)
-  }
-  if (policy.exitLeavePolicy === 'Not confirmed') {
-    notes.push('HR has not confirmed what happens to unused leave when you leave. Do not plan on it being paid out.')
-  }
-  const totalBeforeExit = (exitInCurrentYear ? cur.projected : Math.max(0, cur.projected) + nextYearAvailable)
+  const currentYearCL = cur.byType.CL.projected
+  const mayLapse = !exitInCurrentYear && policy.carryForward !== 'Allowed' ? Math.max(0, currentYearCL) : 0
+  if (mayLapse > 0) notes.push(`Carry-forward is ${policy.carryForward === 'Not allowed' ? 'not allowed' : 'not confirmed'}, so plan to use your remaining ${mayLapse} CL day(s) of this leave year by ${fmtDate(cur.end)}.`)
+  if (policy.exitLeavePolicy === 'Not confirmed') notes.push('HR has not confirmed what happens to unused leave when you leave. Do not plan on it being paid out.')
+  const weddingLeaveBooked = entries.filter((e) => e.forWedding && active(e)).reduce((s, e) => s + countLeaveDays(e, policy), 0)
   return {
     lastWorkingDay: exit,
     exitInCurrentYear,
-    currentYearLeft: cur.projected,
+    currentYearCL,
     nextYearStart,
-    nextYearAvailable,
-    nextYearBooked,
-    totalBeforeExit,
+    nextYearCLBooked,
+    nextYearCL,
+    totalCLBeforeExit: exitInCurrentYear ? currentYearCL : Math.max(0, currentYearCL) + nextYearCL,
     weddingLeaveBooked,
-    workingDaysToExit,
     mayLapse,
     notes,
   }
 }
 
-/** Latest date to submit a leave request, based on the policy's notice requirement. */
-export function requestDeadline(entry: LeaveEntry, policy: LeavePolicy): ISODate {
-  return addDays(entry.startDate, -Math.max(0, policy.requestNoticeDays))
+/** Date to request leave by: the HR notice rule if recorded, otherwise a 14-day planning reminder. */
+export function requestDeadline(entry: LeaveEntry, policy: LeavePolicy): { date: ISODate; fromPolicy: boolean } {
+  const n = policy.requestNoticeDays > 0 ? policy.requestNoticeDays : 14
+  return { date: addDays(entry.startDate, -n), fromPolicy: policy.requestNoticeDays > 0 }
 }

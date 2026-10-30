@@ -4,85 +4,82 @@ import { useUpdate } from '../lib/store'
 import { fmtDate, fmtMonth, fmtMonthShort, monthKey } from '../lib/dates'
 import { money } from '../lib/format'
 import type { SavingsPlan } from '../lib/types'
-import { Alert, Card, NumberField, PageHeader, Stat, StatusBadge, Table, TextField, td, th } from '../components/ui'
+import { Alert, Card, NumberField, PageHeader, Progress, Stat, StatusBadge, Table, TextField, td, th } from '../components/ui'
 import { SavingsTrackChart } from '../components/Charts'
 
 export default function SavingsPlanner() {
-  const { data, savings: s, wedding, balances, job, today } = usePlanner()
+  const { data, savings: s, wedding, today } = usePlanner()
   const update = useUpdate()
   const set = <K extends keyof SavingsPlan>(k: K, v: SavingsPlan[K]) => update((d) => { d.savings[k] = v })
   const cur = monthKey(today)
-  const weddingAccounts = balances.filter((b) => b.purpose === 'wedding')
+  const weddingAcc = data.accounts.find((a) => a.purpose === 'wedding')
+  const emergencyAcc = data.accounts.find((a) => a.purpose === 'emergency')
+  const setOpening = (id: string | undefined, v: number) => id && update((d) => { const a = d.accounts.find((x) => x.id === id); if (a) a.openingBalance = v })
   const trackData = s.rows.map((r) => ({ label: fmtMonthShort(r.month), target: r.cumulativeTarget, actual: r.cumulativeActual }))
-  const extra = s.revisedMonthly - s.plannedMonthly
+  const income = data.employment.takeHomeMonthly
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Savings Planner" subtitle={<>Working backwards from {fmtDate(data.profile.weddingDate)}. Saving months run until {fmtMonth(s.endMonth)}.</>} />
+      <PageHeader title="Savings Planner" subtitle={<>Working back from {fmtDate(data.profile.weddingDate)}. Saving months run until {fmtMonth(s.endMonth)}. Affordability uses your real income and expenses.</>} />
 
-      {/* Status */}
       {s.target <= 0 ? (
-        <Alert level="info">Set your personal wedding budget in <Link className="underline" to="/wedding">Wedding Budget</Link> to start planning.</Alert>
+        <Alert level="info">Enter your total wedding contribution target below (or in <Link className="underline" to="/wedding">Wedding Budget</Link>) to start planning.</Alert>
       ) : s.remaining <= 0 ? (
-        <Alert level="ok">You have already saved or paid your full personal contribution of {money(s.target)}.</Alert>
-      ) : s.plannedMonthly <= 0 ? (
-        <Alert level="warning">You need about {money(s.recommendedMonthly)} a month for the next {s.monthsLeft} months. Enter the amount you plan to save each month below to see if you are on track.</Alert>
-      ) : s.onTrack ? (
-        <Alert level="ok">On track. Saving {money(s.plannedMonthly)} a month, you are projected to have {money(s.projected)} by the wedding — {money(s.gap)} more than you need.</Alert>
+        <Alert level="ok">You have already saved or paid your full contribution of {money(s.target)}.</Alert>
       ) : (
-        <Alert level="danger">
-          Behind plan. At {money(s.plannedMonthly)} a month you are projected to reach {money(s.projected)}, a shortfall of {money(-s.gap)}. To close the gap you would need about {money(s.revisedMonthly)} a month ({money(extra)} more).
-          {s.revisedExceedsSpare
-            ? ` That is more than your estimated spare money of ${money(s.avgSpareMoney)} a month, so it may not be realistic. Consider reducing the budget, using expected extra income, or agreeing a different split with your family.`
-            : ` Your estimated spare money is about ${money(s.avgSpareMoney)} a month. Check this is realistic before you commit to it.`}
-        </Alert>
+        <>
+          {s.behind && <Alert level="danger">You are behind your savings target. See the month-by-month table below.</Alert>}
+          {s.plannedMonthly > 0 && (s.onTrack
+            ? <Alert level="ok">On track: saving {money(s.plannedMonthly)} a month, you are projected to have {money(s.projected)} by the wedding — {money(s.gap)} more than your target.</Alert>
+            : <Alert level="warning">At {money(s.plannedMonthly)} a month you are projected to reach {money(s.projected)} — {money(-s.gap)} short. Closing the gap needs about {money(s.recommendedMonthly)} a month.</Alert>)}
+          {s.expensesSource === 'none' ? (
+            <Alert level="info">Enter your usual monthly expenses (or record a few months of spending) so the planner can check what you can afford.</Alert>
+          ) : s.affordable ? (
+            <Alert level="ok">The recommended {money(s.recommendedMonthly)} a month fits within your estimated spare money of {money(s.avgSpareMoney)} a month.</Alert>
+          ) : (
+            <Alert level="danger">
+              The recommended {money(s.recommendedMonthly)} a month is more than your estimated spare money of {money(Math.max(0, s.avgSpareMoney))} a month (income − expenses − commitments). The target may not be affordable at current numbers — consider a smaller contribution, more time, extra income, or agreeing a different split with your family.
+            </Alert>
+          )}
+        </>
       )}
-      {s.emergencyBelowReserve && <Alert level="warning">Your emergency savings ({money(s.emergencyBalance)}) are below your minimum of {money(data.savings.minimumEmergencyReserve)}. Do not use wedding money planning to dip into this.</Alert>}
-      {s.monthsWithoutSalary.length > 0 && <Alert level="info">No salary is expected after your last working day ({fmtDate(job.lastWorkingDay)}): {s.monthsWithoutSalary.map(fmtMonth).join(', ')}. Plan to finish saving before then.</Alert>}
+      {s.emergencyBelowReserve && <Alert level="warning">Emergency savings ({money(s.emergencyBalance)}) are below your minimum of {money(data.savings.minimumEmergencyReserve)}. Keep this money separate from wedding savings.</Alert>}
+      {s.monthsWithoutSalary.length > 0 && <Alert level="info">No salary is expected in {s.monthsWithoutSalary.map(fmtMonth).join(', ')} (after your last working day). Plan to finish saving before then.</Alert>}
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <Stat label="Target personal contribution" value={money(s.target)} />
+        <Stat label="Contribution target" value={money(s.target)} />
         <Stat label="Saved + paid so far" value={money(s.funded)} sub={`${money(wedding.saved)} saved · ${money(wedding.paid)} paid`} />
-        <Stat label="Still needed" value={money(s.remaining)} />
-        <Stat label="Recommended per month" value={money(s.recommendedMonthly)} sub={`${s.monthsLeft} months incl. ${fmtMonthShort(cur)}`} />
-        <Stat label="Projected by wedding" value={money(s.projected)} sub={s.futureWeddingIncome ? `incl. ${money(s.futureWeddingIncome)} expected extra income` : undefined} />
-        <Stat label={s.gap >= 0 ? 'Surplus' : 'Shortfall'} value={money(Math.abs(s.gap))} tone={s.target > 0 ? (s.gap >= 0 ? 'green' : 'red') : undefined} />
-        <Stat label="Saved this month" value={money(s.thisMonthActual)} sub={s.plannedMonthly ? `Plan: ${money(s.plannedMonthly)}` : undefined} tone={s.plannedMonthly && s.thisMonthActual >= s.plannedMonthly ? 'green' : undefined} />
+        <Stat label="Remaining savings gap" value={money(s.remaining)} />
+        <Stat label="Recommended monthly savings" value={money(s.recommendedMonthly)} sub={`${s.monthsLeft} months incl. ${fmtMonthShort(cur)}`} tone={s.target > 0 && !s.affordable && s.expensesSource !== 'none' ? 'red' : undefined} />
+        <Stat label="Actual savings this month" value={money(s.thisMonthActual)} sub={s.plannedMonthly ? `Target ${money(s.plannedMonthly)}` : undefined} tone={s.plannedMonthly && s.thisMonthActual >= s.plannedMonthly ? 'green' : undefined} />
+        <Stat label="Projected by wedding date" value={money(s.projected)} sub={s.futureWeddingIncome ? `incl. ${money(s.futureWeddingIncome)} expected extra income` : 'At your monthly target'} />
+        <Stat label="Spare money per month (est.)" value={money(s.avgSpareMoney)} sub={`${money(income, true)} income − ${money(s.expensesUsed)} expenses − ${money(data.savings.otherCommitments)} commitments`} tone={s.avgSpareMoney < 0 ? 'red' : undefined} />
         <Stat label="Emergency savings (separate)" value={money(s.emergencyBalance)} />
       </div>
+      {s.target > 0 && <Progress value={s.funded} max={s.target} tone="gold" label="Wedding savings progress" />}
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card title="Your plan">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <NumberField label="Monthly amount I plan to save" prefix="₹" value={data.savings.monthlyAmount} onChange={(v) => set('monthlyAmount', v)} />
-            <NumberField label="Day of month to move savings" value={data.savings.contributionDay} onChange={(v) => set('contributionDay', v)} min={1} max={31} allowDecimal={false} />
-            <NumberField label="Regular monthly expenses" prefix="₹" value={data.savings.regularMonthlyExpenses} onChange={(v) => set('regularMonthlyExpenses', v)} hint="Rent, food, bills, family — your usual spending." />
-            <NumberField label="Minimum emergency savings" prefix="₹" value={data.savings.minimumEmergencyReserve} onChange={(v) => set('minimumEmergencyReserve', v)} hint="Never counted towards the wedding." />
-            <TextField label="Plan start month" type="month" value={data.savings.planStartMonth} onChange={(v) => /^\d{4}-\d{2}$/.test(v) && set('planStartMonth', v)} />
-            <NumberField label="Expected salary (from Job Tracker)" prefix="₹" value={data.job.salaryMonthly} onChange={(v) => update((d) => { d.job.salaryMonthly = v })} />
-          </div>
-          <p className="mt-3 text-xs text-slate-500">Spare money estimate = expected salary + expected extra income − regular expenses. Add bonuses or other expected income in the <Link className="underline" to="/money">Money Tracker</Link>.</p>
-        </Card>
+      <Card title="My numbers" subtitle="Every figure can be changed at any time.">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <NumberField label="Current wedding savings" prefix="₹" value={weddingAcc?.openingBalance ?? 0} onChange={(v) => setOpening(weddingAcc?.id, v)} hint={`Opening balance of “${weddingAcc?.name ?? 'Wedding savings'}”. Later transfers are added automatically.`} />
+          <NumberField label="Total wedding contribution target" prefix="₹" value={data.wedding.personalTotal} onChange={(v) => update((d) => { d.wedding.personalTotal = v })} />
+          <NumberField label="Monthly savings target" prefix="₹" value={data.savings.monthlyAmount} onChange={(v) => set('monthlyAmount', v)} hint="What you plan to move to wedding savings each month." />
+          <NumberField label="Monthly expenses" prefix="₹" value={data.savings.regularMonthlyExpenses} onChange={(v) => set('regularMonthlyExpenses', v)} hint={s.expensesSource === 'recorded' ? `Leave 0 to use your recorded average (${money(s.expensesUsed)}).` : 'Rent, food, transport, family, personal.'} />
+          <NumberField label="Other financial commitments (monthly)" prefix="₹" value={data.savings.otherCommitments} onChange={(v) => set('otherCommitments', v)} hint="Loan EMIs, money sent home, insurance…" />
+          <NumberField label="Emergency savings (current)" prefix="₹" value={emergencyAcc?.openingBalance ?? 0} onChange={(v) => setOpening(emergencyAcc?.id, v)} hint="Opening balance of your emergency account. Never used for the wedding." />
+          <NumberField label="Minimum emergency savings to keep" prefix="₹" value={data.savings.minimumEmergencyReserve} onChange={(v) => set('minimumEmergencyReserve', v)} />
+          <NumberField label="Day of month I move savings" value={data.savings.contributionDay} onChange={(v) => set('contributionDay', v)} min={1} max={31} allowDecimal={false} hint="Salary arrives by the 5th." />
+          <TextField label="Plan start month" type="month" value={data.savings.planStartMonth} onChange={(v) => /^\d{4}-\d{2}$/.test(v) && set('planStartMonth', v)} />
+        </div>
+        <p className="mt-3 text-xs text-slate-500">Each month, record a “Savings” transaction in the Money Tracker from your salary account to your wedding savings account. That is your actual saving for the month.</p>
+      </Card>
 
-        <Card title="Where your wedding money is">
-          <ul className="divide-y divide-cream-200 text-sm">
-            {weddingAccounts.map((a) => <li key={a.id} className="flex justify-between py-2"><span>{a.name}</span><span className="font-semibold tabular-nums">{money(a.balance)}</span></li>)}
-            <li className="flex justify-between py-2"><span>Already paid to vendors</span><span className="font-semibold tabular-nums">{money(wedding.paid)}</span></li>
-            <li className="flex justify-between py-2 font-semibold"><span>Total towards wedding</span><span className="tabular-nums">{money(s.funded)}</span></li>
-          </ul>
-          <p className="mt-3 text-xs text-slate-500">
-            To set your current wedding savings, edit the opening balance of your wedding account in <Link className="underline" to="/settings">Settings</Link>. Each month, record a transfer from your salary account to your wedding account in the Money Tracker — that counts as that month's actual saving.
-          </p>
-        </Card>
-      </div>
-
-      <Card title="Cumulative target vs saved">
+      <Card title="Savings progress" subtitle="Cumulative target vs actual">
         {s.target > 0 && s.rows.length ? <SavingsTrackChart data={trackData} /> : <p className="py-8 text-center text-sm text-slate-500">Set a target to see the chart.</p>}
       </Card>
 
-      <Card title="Month by month" subtitle="Actual = money added to wedding accounts + wedding payments made from other accounts in that month.">
-        <Table caption="Monthly savings plan">
-          <thead><tr><th className={th}>Month</th><th className={`${th} text-right`}>Target</th><th className={`${th} text-right`}>Actual</th><th className={`${th} text-right`}>Cumulative target</th><th className={`${th} text-right`}>Cumulative saved</th><th className={`${th} text-right`}>Spare money (est.)</th><th className={th}>Status</th></tr></thead>
+      <Card title="Target vs actual by month" subtitle="Actual = money added to wedding savings + wedding payments made from other accounts that month.">
+        <Table caption="Monthly savings target versus actual">
+          <thead><tr><th className={th}>Month</th><th className={`${th} text-right`}>Target</th><th className={`${th} text-right`}>Actual</th><th className={`${th} text-right`}>Cumulative target</th><th className={`${th} text-right`}>Cumulative actual</th><th className={`${th} text-right`}>Spare money (est.)</th><th className={th}>Status</th></tr></thead>
           <tbody>
             {s.rows.map((r) => (
               <tr key={r.month} className={r.month === cur ? 'bg-gold-50/50' : undefined}>

@@ -127,3 +127,26 @@ export function relativeDays(n: number): string {
   if (n > 0) return `In ${n} days`
   return `${-n} days ago`
 }
+
+const MONTHS_LONG = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+
+/** "31 July 2027" */
+export function fmtDateLong(s: ISODate | undefined | null): string {
+  if (!isValidISO(s)) return '—'
+  const d = parseISO(s)
+  return `${d.getDate()} ${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}`
+}
+
+export function isMonthEnd(s: ISODate): boolean {
+  return endOfMonth(monthKey(s)) === s
+}
+
+/** Calendar-month addition where a month-end date stays a month-end date (30 Apr + 3 = 31 Jul). */
+export function addMonthsKeepEnd(s: ISODate, n: number): ISODate {
+  const r = addMonths(s, n)
+  return isMonthEnd(s) ? endOfMonth(monthKey(r)) : r
+}
+
+export function minDate(...ds: ISODate[]): ISODate {
+  return ds.filter(isValidISO).sort()[0] ?? ''
+}

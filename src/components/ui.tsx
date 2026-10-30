@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type ButtonHTMLAttributes } from 'react'
-import type { Level } from '../lib/calc/job'
+import type { Level } from '../lib/calc/employment'
 
 export function cx(...c: (string | false | null | undefined)[]) {
   return c.filter(Boolean).join(' ')

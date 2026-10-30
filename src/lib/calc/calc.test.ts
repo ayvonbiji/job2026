@@ -1,200 +1,285 @@
 import { describe, expect, it } from 'vitest'
 import { addMonths, monthRange } from '../dates'
-import { calcJob, latestResignationDate, periodEnd } from './job'
-import { countLeaveDays, leaveYearFor, planWeddingLeave, summariseLeaveYear } from './leave'
-import { accountBalances, calcWedding, monthSummary, weddingContribution } from './finance'
+import { calcEmployment, lastDayFromSubmission, resignationScenario, submissionDeadline } from './employment'
+import { countLeaveDays, leaveYearFor, planWeddingLeave, summariseLeave } from './leave'
+import { accountBalances, calcWedding, monthSummary, recurringOccurrences, salarySchedule, weddingContribution } from './finance'
 import { calcSavings } from './savings'
 import { buildReminders, toICS } from './reminders'
 import { createDefaultData } from '../defaults'
-import type { AppData, LeaveEntry } from '../types'
+import type { AppData, LeaveEntry, Transaction } from '../types'
 import { normalizeData } from '../store'
+import { diffRows, fromRows, groupRows, toRows } from '../cloud/rows'
 
-const TODAY = '2026-10-28'
+const TODAY = '2026-10-30'
+const D = () => createDefaultData()
+const emp = (d: AppData, today = TODAY) => calcEmployment(d.employment, d.resignation, d.milestones, d.profile.weddingDate, d.leavePolicy.holidays, d.leavePolicy.weekendDays, today)
 
-describe('calendar months', () => {
-  it('adds months and clamps to month end', () => {
+describe('dates', () => {
+  it('calendar months clamp to month end', () => {
     expect(addMonths('2027-01-31', 1)).toBe('2027-02-28')
-    expect(addMonths('2028-01-31', 1)).toBe('2028-02-29')
-    expect(addMonths('2027-08-01', -3)).toBe('2027-05-01')
-    expect(addMonths('2026-11-15', 3)).toBe('2027-02-15')
-  })
-  it('lists month ranges', () => {
-    expect(monthRange('2026-11', '2027-02')).toEqual(['2026-11', '2026-12', '2027-01', '2027-02'])
+    expect(monthRange('2026-11', '2027-01')).toEqual(['2026-11', '2026-12', '2027-01'])
   })
 })
 
-describe('notice period', () => {
-  it('3 months ending 31 July 2027 means resigning by 1 May 2027', () => {
-    expect(latestResignationDate('2027-07-31', 3, 'dayBefore')).toBe('2027-05-01')
-    expect(periodEnd('2027-05-01', 3, 'dayBefore')).toBe('2027-07-31')
+describe('employment (Soffit agreement defaults)', () => {
+  const d = D()
+  const e = emp(d)
+  it('prepopulated details', () => {
+    expect(d.employment.company).toBe('Soffit Infrastructure Services Pvt. Ltd.')
+    expect(d.employment.takeHomeMonthly).toBe(13137.93)
+    expect(d.employment.salaryDueDay).toBe(5)
   })
-  it('same-date counting', () => {
-    expect(latestResignationDate('2027-07-31', 3, 'sameDate')).toBe('2027-04-30')
-    expect(periodEnd('2027-04-30', 3, 'sameDate')).toBe('2027-07-30')
+  it('milestone dates', () => {
+    expect(e.day30).toBe('2026-12-02')
+    expect(e.day60).toBe('2027-01-01')
+    expect(e.probationEnd).toBe('2027-01-31')
+    expect(e.oneYear).toBe('2027-11-02')
   })
-  it('result never overshoots the target', () => {
-    for (const target of ['2027-02-28', '2027-03-31', '2027-04-30', '2027-07-31']) {
-      for (const c of ['dayBefore', 'sameDate'] as const) {
-        const r = latestResignationDate(target, 3, c)
-        expect(periodEnd(r, 3, c) <= target).toBe(true)
+  it('31 July 2027 is Scenario A: 3 months, submit by 30 April 2027, HR approval needed', () => {
+    const p = e.plan!
+    expect(p.scenario).toBe('A')
+    expect(p.beforeMinTenure).toBe(true)
+    expect(p.noticeMonths).toBe(3)
+    expect(p.deadline).toBe('2027-04-30')
+    expect(p.noticeStart).toBe('2027-05-01')
+    expect(p.approvalRequired).toBe(true)
+    expect(p.clauses.map((c) => c.ref)).toEqual(['Clause 10.2.1', 'Clause 10.2.2', 'Clause 10.2.3'])
+    expect(e.plannedLastDay).toBe('2027-07-31')
+  })
+  it('after the one-year anniversary is Scenario B: 2 months, Clause 10.3', () => {
+    const p = resignationScenario(d.employment, '2027-12-31', '2028-06-01', [], [0], TODAY)!
+    expect(p.scenario).toBe('B')
+    expect(p.noticeMonths).toBe(2)
+    expect(p.deadline).toBe('2027-10-31')
+    expect(p.approvalRequired).toBe(false)
+    expect(p.clauses[0].ref).toBe('Clause 10.3')
+    expect(p.notices.some((n) => n.text.includes('Clause 10.2 or Clause 10.3'))).toBe(true)
+  })
+  it('notice maths is consistent for both counting methods', () => {
+    for (const last of ['2027-07-31', '2027-06-30', '2027-03-15', '2027-02-28']) {
+      for (const c of ['calendar', 'inclusive'] as const) {
+        const dl = submissionDeadline(last, 3, c)
+        expect(lastDayFromSubmission(dl, 3, c) <= last).toBe(true)
       }
     }
+    expect(submissionDeadline('2027-07-31', 3, 'inclusive')).toBe('2027-05-01')
+    expect(lastDayFromSubmission('2027-04-30', 3, 'calendar')).toBe('2027-07-31')
   })
-  it('training and probation are separate milestones', () => {
-    const d = createDefaultData()
-    d.job.joiningDate = '2026-11-02'
-    d.job.probationStartMode = 'afterTraining'
-    const j = calcJob(d.job, d.profile.weddingDate, [], [0, 6], TODAY)
-    expect(j.trainingEnd).toBe('2027-02-01')
-    expect(j.probationStart).toBe('2027-02-02')
-    expect(j.probationEnd).toBe('2027-05-01')
-    expect(j.resignationDate).toBe('2027-05-01')
-    expect(j.lastWorkingDay).toBe('2027-07-31')
-    // resigning on the day probation ends triggers a probation warning
-    expect(j.notices.some((n) => n.text.includes('probation confirmation'))).toBe(true)
+  it('a planned submission after the deadline is flagged', () => {
+    const d2 = D()
+    d2.resignation.plannedSubmissionDate = '2027-05-10'
+    const e2 = emp(d2)
+    expect(e2.plannedLastDay).toBe('2027-08-10')
+    expect(e2.notices.some((n) => n.level === 'danger' && n.text.includes('Submit by 30 Apr 2027'))).toBe(true)
   })
-  it('warns when the planned resignation is too late', () => {
-    const d = createDefaultData()
-    d.job.plannedResignationDate = '2027-05-15'
-    const j = calcJob(d.job, d.profile.weddingDate, [], [0, 6], TODAY)
-    expect(j.lastWorkingDay).toBe('2027-08-14')
-    expect(j.notices.filter((n) => n.level === 'danger').length).toBeGreaterThan(0)
-  })
-  it('flags a resignation date on a weekend', () => {
-    const d = createDefaultData() // 1 May 2027 is a Saturday
-    const j = calcJob(d.job, d.profile.weddingDate, [], [0, 6], TODAY)
-    expect(j.notices.some((n) => n.text.includes('Saturday'))).toBe(true)
+  it('employment progress', () => {
+    const e2 = emp(d, '2027-01-31')
+    expect(e2.daysEmployed).toBe(90)
+    expect(e2.employmentTotalDays).toBe(271)
   })
 })
 
 function leave(p: Partial<LeaveEntry>): LeaveEntry {
-  return { id: Math.random().toString(), type: 'Annual', status: 'Approved', startDate: '', endDate: '', startHalf: false, endHalf: false, forWedding: false, notes: '', ...p }
+  return { id: Math.random().toString(), type: 'CL', status: 'Approved', startDate: '', endDate: '', startHalf: false, endHalf: false, days: null, reason: '', notes: '', forWedding: false, ...p }
 }
 
-describe('leave', () => {
-  const d = createDefaultData()
-  d.leavePolicy.annualEntitlement = 18
-  d.leavePolicy.holidays = [{ id: 'h', date: '2026-12-25', name: 'Christmas' }]
-
-  it('skips weekends and holidays and counts half days', () => {
-    // Mon 21 Dec – Fri 25 Dec (25th holiday) = 4 days
-    expect(countLeaveDays(leave({ startDate: '2026-12-21', endDate: '2026-12-25' }), d.leavePolicy)).toBe(4)
-    // Fri 23 Oct – Mon 26 Oct = 2 working days
-    expect(countLeaveDays(leave({ startDate: '2026-10-23', endDate: '2026-10-26' }), d.leavePolicy)).toBe(2)
-    expect(countLeaveDays(leave({ startDate: '2026-10-23', endDate: '2026-10-23', startHalf: true }), d.leavePolicy)).toBe(0.5)
-    expect(countLeaveDays(leave({ startDate: '2026-10-22', endDate: '2026-10-23', startHalf: true, endHalf: true }), d.leavePolicy)).toBe(1)
+describe('leave (CL and SL separate, no assumed rules)', () => {
+  const d = D()
+  it('counts calendar days by default and working days only when configured', () => {
+    const l = leave({ startDate: '2026-12-24', endDate: '2026-12-28' }) // Thu–Mon
+    expect(countLeaveDays(l, d.leavePolicy)).toBe(5)
+    const p = { ...d.leavePolicy, dayCountRule: 'working' as const, weekendDays: [0], holidays: [{ id: 'h', date: '2026-12-25', name: 'Christmas' }] }
+    expect(countLeaveDays(l, p)).toBe(3)
+    expect(countLeaveDays(leave({ startDate: '2026-12-24', endDate: '2026-12-24', startHalf: true }), d.leavePolicy)).toBe(0.5)
+    expect(countLeaveDays(leave({ startDate: '2026-12-24', endDate: '2026-12-28', days: 2 }), d.leavePolicy)).toBe(2)
   })
-
-  it('does not deduct pending leave from the confirmed balance', () => {
+  it('keeps CL and SL balances apart; pending is not deducted', () => {
     const entries = [
-      leave({ status: 'Taken', startDate: '2026-03-02', endDate: '2026-03-04' }), // 3 used
-      leave({ status: 'Approved', startDate: '2026-11-02', endDate: '2026-11-03' }), // 2 approved upcoming
-      leave({ status: 'Pending', startDate: '2026-12-07', endDate: '2026-12-07' }), // 1 pending
-      leave({ status: 'Rejected', startDate: '2026-12-08', endDate: '2026-12-08' }),
+      leave({ type: 'CL', status: 'Taken', startDate: '2026-12-01', endDate: '2026-12-02' }),
+      leave({ type: 'CL', status: 'Pending', startDate: '2026-12-20', endDate: '2026-12-20' }),
+      leave({ type: 'SL', status: 'Taken', startDate: '2026-12-05', endDate: '2026-12-05' }),
+      leave({ type: 'LOA', status: 'Taken', startDate: '2026-12-10', endDate: '2026-12-11' }),
     ]
-    const s = summariseLeaveYear(entries, { ...d.leavePolicy, carryover: 5, carryoverConfirmedByHr: false }, TODAY)
-    expect(s.used).toBe(3)
-    expect(s.available).toBe(15) // unconfirmed carryover not added
-    expect(s.carryoverUnconfirmed).toBe(5)
-    expect(s.afterApproved).toBe(13)
-    expect(s.projected).toBe(12)
-    const s2 = summariseLeaveYear(entries, { ...d.leavePolicy, carryover: 5, carryoverConfirmedByHr: true }, TODAY)
-    expect(s2.available).toBe(20)
+    const s = summariseLeave(entries, d.leavePolicy, d.employment.joiningDate, '2026-12-31')
+    expect(s.byType.CL.available).toBe(10)
+    expect(s.byType.CL.pending).toBe(1)
+    expect(s.byType.CL.projected).toBe(9)
+    expect(s.byType.SL.available).toBe(11)
+    expect(s.loa.taken).toBe(2)
   })
-
-  it('leave year with April start', () => {
-    expect(leaveYearFor('2026-10-28', 4)).toEqual({ start: '2026-04-01', end: '2027-03-31' })
+  it('monthly accrual only when HR rule recorded', () => {
+    const p = { ...d.leavePolicy, accrual: 'Monthly' as const }
+    const s = summariseLeave([], p, '2026-11-02', '2026-12-15')
+    expect(s.byType.CL.accruedToDate).toBe(2) // Nov + Dec
+  })
+  it('leave years', () => {
+    expect(leaveYearFor('2026-10-30', 1)).toEqual({ start: '2026-01-01', end: '2026-12-31' })
     expect(leaveYearFor('2027-02-01', 4)).toEqual({ start: '2026-04-01', end: '2027-03-31' })
   })
-
-  it('wedding leave plan spans the next leave year and warns about lapse', () => {
-    const p = planWeddingLeave([], { ...d.leavePolicy, nextYearEntitlementBeforeExit: 10 }, '2027-07-31', TODAY)
+  it('wedding leave planner spans into 2027', () => {
+    const p = planWeddingLeave([], { ...d.leavePolicy, nextYearCLBeforeExit: 7 }, d.employment.joiningDate, '2027-07-31', TODAY)
     expect(p.exitInCurrentYear).toBe(false)
-    expect(p.nextYearStart).toBe('2027-01-01')
-    expect(p.totalBeforeExit).toBe(28)
-    expect(p.mayLapse).toBe(18)
+    expect(p.totalCLBeforeExit).toBe(12 + 7)
+    expect(p.mayLapse).toBe(12)
   })
 })
 
+function tx(p: Partial<Transaction>): Transaction {
+  return { id: Math.random().toString(36).slice(2), date: '2026-12-01', type: 'expense', amount: 0, category: 'Food', description: '', paymentMethod: 'UPI', accountId: 'acc-main', toAccountId: '', weddingCategoryId: '', recurringId: '', occurrence: '', notes: '', ...p }
+}
+
 function financeData(): AppData {
-  const d = createDefaultData()
-  d.accounts[0].openingBalance = 10000
-  d.accounts[1].openingBalance = 50000
-  d.wedding.personalTotal = 300000
-  d.wedding.categories[0].planned = 40000
-  const tx = (p: Partial<AppData['transactions'][number]>) => ({ id: Math.random().toString(), date: '2026-10-01', type: 'expense' as const, amount: 0, category: '', accountId: 'acc-main', toAccountId: '', weddingCategoryId: '', notes: '', ...p })
+  const d = D()
+  d.accounts[0].openingBalance = 5000
+  d.accounts[1].openingBalance = 20000
+  d.wedding.personalTotal = 150000
+  d.wedding.categories[0].planned = 30000
+  d.salaryRecords = [{ id: 's1', payMonth: '2026-12', expectedDate: '2026-12-05', expectedAmount: 13137.93, actualDate: '2026-12-04', actualAmount: 13137.93, accountId: 'acc-main', notes: '' }]
   d.transactions = [
-    tx({ type: 'income', category: 'Salary', amount: 60000 }),
-    tx({ category: 'Food and groceries', amount: 8000, date: '2026-10-05' }),
-    tx({ type: 'transfer', amount: 20000, toAccountId: 'acc-wedding', date: '2026-10-06' }),
-    tx({ category: 'Wedding expenses', amount: 15000, weddingCategoryId: 'wc-1', accountId: 'acc-wedding', date: '2026-10-10' }),
-    tx({ category: 'Wedding expenses', amount: 5000, weddingCategoryId: 'wc-1', date: '2026-10-12' }),
-    tx({ category: 'Rent and bills', amount: 9000, date: '2026-11-03' }), // scheduled
-    tx({ type: 'transfer', amount: 5000, toAccountId: 'acc-emergency', date: '2026-10-07' }),
+    tx({ category: 'Food', amount: 3000, date: '2026-12-08' }),
+    tx({ category: 'Accommodation / Rent', amount: 4000, date: '2026-12-06' }),
+    tx({ type: 'transfer', category: '', amount: 3000, toAccountId: 'acc-wedding', date: '2026-12-06' }),
+    tx({ category: 'Wedding expenses', amount: 5000, weddingCategoryId: 'wc2-1', accountId: 'acc-wedding', date: '2026-12-10' }),
+    tx({ category: 'Wedding expenses', amount: 1000, weddingCategoryId: 'wc2-1', date: '2026-12-12' }),
+    tx({ category: 'Food', amount: 700, date: '2027-01-02' }), // future
   ]
   return d
 }
 
-describe('finance and wedding', () => {
-  it('excludes transfers from income and expenses; wedding expense counted once', () => {
+describe('money', () => {
+  const T = '2026-12-31'
+  it('salary schedule: paid by the 5th of the next month', () => {
     const d = financeData()
-    const s = monthSummary(d, '2026-10', TODAY)
-    expect(s.income).toBe(60000)
-    expect(s.expenses).toBe(8000 + 15000 + 5000)
-    expect(s.savings).toBe(60000 - 28000)
+    const rows = salarySchedule(d, '2027-07-31', T)
+    expect(rows[0].payMonth).toBe('2026-12')
+    expect(rows[0].status).toBe('Received')
+    expect(rows[rows.length - 1].payMonth).toBe('2027-08')
+    expect(rows[1].expectedDate).toBe('2027-01-05')
+    expect(salarySchedule(D(), '2027-07-31', '2026-12-06')[0].status).toBe('Overdue')
   })
-  it('balances, excluding scheduled transactions', () => {
-    const b = accountBalances(financeData(), TODAY)
-    expect(b.find((x) => x.id === 'acc-main')!.balance).toBe(10000 + 60000 - 8000 - 20000 - 5000 - 5000)
-    expect(b.find((x) => x.id === 'acc-wedding')!.balance).toBe(50000 + 20000 - 15000)
-    expect(b.find((x) => x.id === 'acc-emergency')!.balance).toBe(5000)
+  it('monthly summary excludes savings transfers and counts wedding payments once', () => {
+    const s = monthSummary(financeData(), '2026-12', T)
+    expect(s.salary).toBeCloseTo(13137.93)
+    expect(s.expenses).toBe(3000 + 4000 + 5000 + 1000)
+    expect(s.savings).toBeCloseTo(13137.93 - 13000)
+    expect(s.movedToSavings).toBe(3000)
   })
-  it('wedding totals', () => {
-    const w = calcWedding(financeData(), TODAY)
-    expect(w.paid).toBe(20000)
-    expect(w.saved).toBe(55000)
-    expect(w.funded).toBe(75000)
-    expect(w.remainingToSave).toBe(225000)
+  it('balances include received salary, exclude future items', () => {
+    const b = accountBalances(financeData(), T)
+    expect(b.find((x) => x.id === 'acc-main')!.balance).toBeCloseTo(5000 + 13137.93 - 3000 - 4000 - 3000 - 1000)
+    expect(b.find((x) => x.id === 'acc-wedding')!.balance).toBe(20000 + 3000 - 5000)
+  })
+  it('wedding metrics', () => {
+    const w = calcWedding(financeData(), T)
+    expect(w.paid).toBe(6000)
+    expect(w.unpaidCommitments).toBe(24000)
+    expect(w.saved).toBe(18000)
+    expect(w.remainingToSave).toBe(150000 - 24000)
     expect(w.categories[0].status).toBe('Partially Paid')
-    expect(w.categories[0].remaining).toBe(20000)
+    expect(Math.round(w.budgetCompletion)).toBe(4)
+    expect(weddingContribution(financeData(), '2026-12', T)).toBe(3000 + 1000)
   })
-  it('monthly wedding contribution = transfers in + wedding bills from other accounts', () => {
-    expect(weddingContribution(financeData(), '2026-10', TODAY)).toBe(20000 + 5000)
-  })
-  it('savings plan: recommended and projection', () => {
+  it('recurring occurrences and posting', () => {
     const d = financeData()
-    d.savings.monthlyAmount = 20000
-    const s = calcSavings(d, '2027-07-31', TODAY)
-    expect(s.endMonth).toBe('2027-07')
-    expect(s.monthsLeft).toBe(10)
-    expect(s.recommendedMonthly).toBe(22500)
-    // already contributed 25,000 this month (> plan), so 9 more months at 20,000
-    expect(s.projected).toBe(75000 + 9 * 20000)
-    expect(s.onTrack).toBe(false)
-    expect(s.gap).toBe(255000 - 300000)
+    d.recurring = [{ id: 'r1', description: 'Rent', type: 'expense', category: 'Accommodation / Rent', amount: 4000, accountId: 'acc-main', toAccountId: '', paymentMethod: 'UPI', dayOfMonth: 6, startMonth: '2026-12', endMonth: '2027-02', active: true }]
+    d.transactions.push(tx({ recurringId: 'r1', occurrence: '2026-12', amount: 4000, date: '2026-12-06' }))
+    const occ = recurringOccurrences(d, '2026-11', '2027-06')
+    expect(occ.map((o) => o.month)).toEqual(['2026-12', '2027-01', '2027-02'])
+    expect(occ[0].posted).not.toBeNull()
+    expect(occ[1].date).toBe('2027-01-06')
   })
 })
 
-describe('reminders and backup', () => {
-  it('builds reminders and ICS', () => {
+describe('savings planner', () => {
+  it('recommends a monthly amount and checks affordability against income − expenses', () => {
     const d = financeData()
-    d.job.joiningDate = '2026-11-02'
-    d.job.salaryMonthly = 50000
-    const job = calcJob(d.job, d.profile.weddingDate, [], [0, 6], TODAY)
-    const r = buildReminders(d, job, TODAY)
-    expect(r.some((x) => x.title === 'Resignation deadline' && x.date === '2027-05-01')).toBe(true)
-    expect(r.some((x) => x.key === 'money:salary:2026-11')).toBe(true)
-    const ics = toICS(r.slice(0, 2))
-    expect(ics).toContain('BEGIN:VCALENDAR')
-    expect(ics).toContain('DTSTART;VALUE=DATE:')
+    d.savings.monthlyAmount = 3000
+    d.savings.regularMonthlyExpenses = 9000
+    d.savings.otherCommitments = 500
+    const s = calcSavings(d, '2027-07-31', '2026-12-31')
+    expect(s.endMonth).toBe('2027-08') // contribution day 6 is before the 23rd
+    expect(s.monthsLeft).toBe(9)
+    expect(s.recommendedMonthly).toBe(Math.ceil((150000 - 24000) / 9))
+    expect(s.affordable).toBe(false)
+    expect(s.onTrack).toBe(false)
+    expect(Math.round(s.rows.find((r) => r.month === '2027-02')!.spareMoney)).toBe(Math.round(13137.93 - 9500))
   })
-  it('normalises backups and rejects junk', () => {
+  it('uses recorded expenses when none are entered', () => {
+    const s = calcSavings(financeData(), '2027-07-31', '2027-01-15')
+    expect(s.expensesSource).toBe('recorded')
+    expect(s.expensesUsed).toBe(7000) // wedding payments excluded
+  })
+})
+
+describe('reminders', () => {
+  it('includes contract milestones, salary and wedding day', () => {
     const d = financeData()
-    const round = normalizeData(JSON.parse(JSON.stringify(d)))
-    expect(round.transactions.length).toBe(d.transactions.length)
+    const r = buildReminders(d, emp(d), TODAY)
+    const keys = r.map((x) => x.key)
+    expect(r.find((x) => x.key === 'ms:resignationSubmission')!.date).toBe('2027-04-30')
+    expect(r.find((x) => x.key === 'ms:probation')!.date).toBe('2027-01-31')
+    expect(keys).toContain('salary:2026-12')
+    expect(r.find((x) => x.key === 'salary:2026-12')!.completed).toBe(true)
+    expect(keys.some((k) => k.startsWith('wedding:day'))).toBe(true)
+    expect(toICS(r.slice(0, 2))).toContain('BEGIN:VEVENT')
+  })
+})
+
+describe('storage, migration and Supabase rows', () => {
+  it('migrates version 1 data', () => {
+    const v1 = {
+      version: 1,
+      profile: { name: 'Ayvon', weddingDate: '2027-08-23' },
+      job: { company: 'Old', joiningDate: '2026-08-01', targetLastDay: '2027-07-31', notes: 'hello', hrContacts: [] },
+      leavePolicy: { weekendDays: [0, 6], holidays: [{ id: 'h1', date: '2026-12-25', name: 'Christmas' }] },
+      leaves: [{ id: 'l1', type: 'Sick', status: 'Taken', startDate: '2026-10-01', endDate: '2026-10-01' }],
+      accounts: [{ id: 'acc-main', name: 'Main', purpose: 'general', openingBalance: 100 }],
+      transactions: [
+        { id: 't1', date: '2026-10-01', type: 'income', amount: 13000, category: 'Salary', accountId: 'acc-main' },
+        { id: 't2', date: '2026-10-02', type: 'expense', amount: 50, category: 'Food and groceries', accountId: 'acc-main' },
+      ],
+      wedding: { personalTotal: 0, categories: [{ id: 'wc-1', name: 'Clothes', planned: 0 }] },
+      checklist: [{ id: 'ck-1', title: 'x', status: 'Not started' }],
+    }
+    const d = normalizeData(v1)
+    expect(d.version).toBe(2)
+    expect(d.employment.company).toContain('Soffit')
+    expect(d.employment.notes).toBe('hello')
+    expect(d.leaves[0].type).toBe('SL')
+    expect(d.salaryRecords[0].actualAmount).toBe(13000)
+    expect(d.transactions[0].category).toBe('Food')
+    expect(d.wedding.categories.length).toBe(13)
+    expect(d.checklist.length).toBe(14)
+  })
+  it('rejects junk and repairs bad links', () => {
     expect(() => normalizeData({ hello: 1 })).toThrow()
-    const partial = normalizeData({ version: 1, job: { salaryMonthly: 'abc' } })
-    expect(partial.job.salaryMonthly).toBe(0)
-    expect(partial.wedding.categories.length).toBe(12)
+    const d = financeData()
+    d.transactions[0].accountId = 'missing'
+    expect(normalizeData(JSON.parse(JSON.stringify(d))).transactions[0].accountId).toBe('acc-main')
+  })
+  it('round-trips through database rows', () => {
+    const d = financeData()
+    d.recurring = [{ id: 'r1', description: 'Rent', type: 'expense', category: 'Accommodation / Rent', amount: 4000, accountId: 'acc-main', toAccountId: '', paymentMethod: 'UPI', dayOfMonth: 6, startMonth: '2026-12', endMonth: '', active: true }]
+    d.leaves = [leave({ type: 'CL', startDate: '2027-01-04', endDate: '2027-01-05', days: 1.5, reason: 'Trip' })]
+    d.reminders.completed['x'] = '2026-10-30'
+    d.resignation.hrConfirmedLiability = 1000
+    const back = fromRows(groupRows(toRows(d)))!
+    const expected = normalizeData(JSON.parse(JSON.stringify(d)))
+    const byId = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : 1)
+    back.transactions.sort(byId)
+    expected.transactions.sort(byId)
+    expect(back).toEqual(expected)
+  })
+  it('diff: changing a transaction type moves it between tables', () => {
+    const a = financeData()
+    const b = structuredClone(a)
+    b.transactions[0].type = 'transfer'
+    b.transactions[0].toAccountId = 'acc-emergency'
+    b.checklist.pop()
+    const diff = diffRows(toRows(a), toRows(b))
+    expect(diff.upserts.get('savings_records')!.length).toBe(1)
+    expect(diff.deletes.get('expenses')).toEqual([a.transactions[0].id])
+    expect(diff.deletes.get('wedding_checklist')!.length).toBe(1)
+    expect(diffRows(toRows(a), toRows(a)).count).toBe(0)
   })
 })

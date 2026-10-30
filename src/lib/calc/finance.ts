@@ -1,7 +1,46 @@
-import type { AppData, ISODate, MonthKey, Transaction, WeddingCategory } from '../types'
-import { addMonthKey, isValidISO, monthKey, monthRange, monthsBetweenKeys, todayISO } from '../dates'
+import type { AppData, ISODate, MonthKey, RecurringItem, SalaryRecord, Transaction, WeddingCategory } from '../types'
+import { addDays, addMonthKey, dayInMonth, isValidISO, monthKey, monthRange, monthsBetweenKeys, todayISO } from '../dates'
 
-export const isPosted = (t: Transaction, today: ISODate) => t.date <= today
+export const isPosted = (t: Pick<Transaction, 'date'>, today: ISODate) => t.date <= today
+const salaryReceived = (s: SalaryRecord, today: ISODate) => s.actualAmount !== null && isValidISO(s.actualDate) && s.actualDate <= today
+
+// ---------- Salary ----------
+
+export type SalaryStatus = 'Received' | 'Received (less than expected)' | 'Expected' | 'Overdue'
+export interface SalaryRow {
+  payMonth: MonthKey
+  expectedDate: ISODate
+  expectedAmount: number
+  record: SalaryRecord | null
+  status: SalaryStatus
+}
+
+/** Months in which salary is paid: the month after joining through the month after the last working day. */
+export function salaryPayMonths(data: AppData, lastDay: ISODate): MonthKey[] {
+  const e = data.employment
+  if (!isValidISO(e.joiningDate)) return []
+  const first = addMonthKey(monthKey(e.joiningDate), 1)
+  const last = isValidISO(lastDay) ? addMonthKey(monthKey(lastDay), 1) : addMonthKey(first, 11)
+  return monthRange(first, last)
+}
+
+export function salarySchedule(data: AppData, lastDay: ISODate, today = todayISO()): SalaryRow[] {
+  const e = data.employment
+  const months = new Set(salaryPayMonths(data, lastDay))
+  for (const r of data.salaryRecords) months.add(r.payMonth)
+  return [...months].sort().map((m) => {
+    const record = data.salaryRecords.find((r) => r.payMonth === m) ?? null
+    const expectedDate = record?.expectedDate || dayInMonth(m, e.salaryDueDay)
+    const expectedAmount = record ? record.expectedAmount : e.takeHomeMonthly
+    let status: SalaryStatus = today > expectedDate ? 'Overdue' : 'Expected'
+    if (record && record.actualAmount !== null && isValidISO(record.actualDate)) {
+      status = record.actualAmount + 0.5 < expectedAmount ? 'Received (less than expected)' : 'Received'
+    }
+    return { payMonth: m, expectedDate, expectedAmount, record, status }
+  })
+}
+
+// ---------- Balances & monthly summary ----------
 
 export interface AccountBalance {
   id: string
@@ -12,69 +51,99 @@ export interface AccountBalance {
 
 export function accountBalances(data: AppData, today = todayISO()): AccountBalance[] {
   const map = new Map(data.accounts.map((a) => [a.id, a.openingBalance]))
+  const add = (id: string, n: number) => map.has(id) && map.set(id, map.get(id)! + n)
   for (const t of data.transactions) {
     if (!isPosted(t, today)) continue
-    if (t.type === 'income' && map.has(t.accountId)) map.set(t.accountId, map.get(t.accountId)! + t.amount)
-    if (t.type === 'expense' && map.has(t.accountId)) map.set(t.accountId, map.get(t.accountId)! - t.amount)
+    if (t.type === 'income') add(t.accountId, t.amount)
+    if (t.type === 'expense') add(t.accountId, -t.amount)
     if (t.type === 'transfer') {
-      if (map.has(t.accountId)) map.set(t.accountId, map.get(t.accountId)! - t.amount)
-      if (map.has(t.toAccountId)) map.set(t.toAccountId, map.get(t.toAccountId)! + t.amount)
+      add(t.accountId, -t.amount)
+      add(t.toAccountId, t.amount)
     }
   }
-  return data.accounts.map((a) => ({ id: a.id, name: a.name, purpose: a.purpose, balance: map.get(a.id) ?? 0 }))
+  for (const s of data.salaryRecords) if (salaryReceived(s, today)) add(s.accountId, s.actualAmount!)
+  return data.accounts.map((a) => ({ id: a.id, name: a.name, purpose: a.purpose, balance: Math.round((map.get(a.id) ?? 0) * 100) / 100 }))
 }
 
 export interface MonthSummary {
   month: MonthKey
+  salary: number
+  otherIncome: number
   income: number
   expenses: number
-  savings: number
+  savings: number // income − expenses
+  movedToSavings: number // transfers into wedding/emergency accounts (not an expense)
   byCategory: Record<string, number>
 }
 
-/** Income and expenses for a month. Transfers between your own accounts are not counted. */
 export function monthSummary(data: AppData, month: MonthKey, today = todayISO()): MonthSummary {
-  let income = 0
+  let otherIncome = 0
   let expenses = 0
+  let movedToSavings = 0
   const byCategory: Record<string, number> = {}
+  const savingsAcc = new Set(data.accounts.filter((a) => a.purpose !== 'general').map((a) => a.id))
   for (const t of data.transactions) {
     if (monthKey(t.date) !== month || !isPosted(t, today)) continue
-    if (t.type === 'income') income += t.amount
+    if (t.type === 'income') otherIncome += t.amount
     if (t.type === 'expense') {
       expenses += t.amount
-      byCategory[t.category || 'Other expenses'] = (byCategory[t.category || 'Other expenses'] ?? 0) + t.amount
+      const c = t.category || 'Other expenses'
+      byCategory[c] = (byCategory[c] ?? 0) + t.amount
     }
+    if (t.type === 'transfer' && savingsAcc.has(t.toAccountId) && !savingsAcc.has(t.accountId)) movedToSavings += t.amount
   }
-  return { month, income, expenses, savings: income - expenses, byCategory }
+  let salary = 0
+  for (const s of data.salaryRecords) if (salaryReceived(s, today) && monthKey(s.actualDate) === month) salary += s.actualAmount!
+  const income = salary + otherIncome
+  return { month, salary, otherIncome, income, expenses, savings: income - expenses, movedToSavings, byCategory }
 }
 
 export function monthsWithData(data: AppData, today = todayISO()): MonthKey[] {
   const cur = monthKey(today)
-  const posted = data.transactions.filter((t) => isPosted(t, today)).map((t) => monthKey(t.date))
-  const first = posted.length ? posted.reduce((a, b) => (a < b ? a : b)) : cur
+  const dates = [
+    ...data.transactions.filter((t) => isPosted(t, today)).map((t) => t.date),
+    ...data.salaryRecords.filter((s) => salaryReceived(s, today)).map((s) => s.actualDate),
+  ].map(monthKey)
+  const first = dates.length ? dates.reduce((a, b) => (a < b ? a : b)) : cur
   const start = monthsBetweenKeys(first, cur) > 23 ? addMonthKey(cur, -23) : first
   return monthRange(start, cur)
 }
 
-export function expectedIncomeFor(data: AppData, month: MonthKey, lastWorkingDay: ISODate): { salary: number; other: number; items: { label: string; amount: number }[] } {
-  const items: { label: string; amount: number }[] = []
-  let salary = 0
-  const j = data.job
-  const startOk = !isValidISO(j.joiningDate) || monthKey(j.joiningDate) <= month
-  const endOk = !isValidISO(lastWorkingDay) || month <= monthKey(lastWorkingDay)
-  if (j.salaryMonthly > 0 && startOk && endOk) {
-    salary = j.salaryMonthly
-    items.push({ label: 'Salary', amount: salary })
-  }
+export function expectedIncomeFor(data: AppData, month: MonthKey, lastDay: ISODate): { salary: number; other: number; forWedding: number } {
+  const salary = salaryPayMonths(data, lastDay).includes(month) ? (data.salaryRecords.find((r) => r.payMonth === month)?.expectedAmount ?? data.employment.takeHomeMonthly) : 0
   let other = 0
-  for (const e of data.expectedIncome) {
-    if (e.month === month) {
-      other += e.amount
-      items.push({ label: e.label || 'Other income', amount: e.amount })
+  let forWedding = 0
+  for (const e of data.expectedIncome) if (e.month === month) {
+    other += e.amount
+    forWedding += e.forWedding
+  }
+  return { salary, other, forWedding }
+}
+
+// ---------- Recurring ----------
+
+export interface Occurrence {
+  item: RecurringItem
+  month: MonthKey
+  date: ISODate
+  posted: Transaction | null
+}
+
+export function recurringOccurrences(data: AppData, fromMonth: MonthKey, toMonth: MonthKey): Occurrence[] {
+  const out: Occurrence[] = []
+  for (const r of data.recurring) {
+    if (!r.active || !/^\d{4}-\d{2}$/.test(r.startMonth)) continue
+    const a = r.startMonth > fromMonth ? r.startMonth : fromMonth
+    const b = r.endMonth && r.endMonth < toMonth ? r.endMonth : toMonth
+    for (const m of monthRange(a, b)) {
+      const posted = data.transactions.find((t) => t.recurringId === r.id && t.occurrence === m) ?? null
+      out.push({ item: r, month: m, date: dayInMonth(m, r.dayOfMonth), posted })
     }
   }
-  return { salary, other, items }
+  return out.sort((x, y) => (x.date < y.date ? -1 : 1))
 }
+
+// ---------- Wedding ----------
 
 export interface WeddingCategoryCalc extends WeddingCategory {
   paid: number
@@ -85,65 +154,60 @@ export interface WeddingCategoryCalc extends WeddingCategory {
 }
 
 export interface WeddingCalc {
-  target: number // personal total, or sum of categories if not set
+  target: number
   categoriesTotal: number
   categories: WeddingCategoryCalc[]
   paid: number
+  unpaidCommitments: number
   remainingBudget: number
-  saved: number // money currently sitting in wedding accounts
+  saved: number // wedding savings available (balance of wedding accounts)
   funded: number // saved + paid
   remainingToSave: number
-  progress: number // %
-  unlinkedWeddingSpend: number // "Wedding expenses" transactions with no budget category
-}
-
-export function weddingPaidByCategory(data: AppData, today = todayISO()) {
-  const paid = new Map<string, number>()
-  const scheduled = new Map<string, number>()
-  for (const t of data.transactions) {
-    if (t.type !== 'expense' || !t.weddingCategoryId) continue
-    const m = isPosted(t, today) ? paid : scheduled
-    m.set(t.weddingCategoryId, (m.get(t.weddingCategoryId) ?? 0) + t.amount)
-  }
-  return { paid, scheduled }
+  budgetCompletion: number // paid ÷ budget
+  progress: number // (saved + paid) ÷ budget
+  unlinkedWeddingSpend: number
 }
 
 export function calcWedding(data: AppData, today = todayISO()): WeddingCalc {
-  const { paid, scheduled } = weddingPaidByCategory(data, today)
+  const paidMap = new Map<string, number>()
+  const schedMap = new Map<string, number>()
+  for (const t of data.transactions) {
+    if (t.type !== 'expense' || !t.weddingCategoryId) continue
+    const m = isPosted(t, today) ? paidMap : schedMap
+    m.set(t.weddingCategoryId, (m.get(t.weddingCategoryId) ?? 0) + t.amount)
+  }
   const categories: WeddingCategoryCalc[] = data.wedding.categories.map((c) => {
-    const p = paid.get(c.id) ?? 0
+    const p = paidMap.get(c.id) ?? 0
     const remaining = Math.max(0, c.planned - p)
-    const status: WeddingCategoryCalc['status'] = p <= 0 ? 'Not Paid' : c.planned > 0 && p >= c.planned ? 'Paid' : 'Partially Paid'
     return {
       ...c,
       paid: p,
-      scheduled: scheduled.get(c.id) ?? 0,
+      scheduled: schedMap.get(c.id) ?? 0,
       remaining,
-      status,
+      status: p <= 0 ? 'Not Paid' : c.planned > 0 && p >= c.planned ? 'Paid' : 'Partially Paid',
       overdue: !!c.dueDate && c.dueDate < today && remaining > 0,
     }
   })
   const categoriesTotal = categories.reduce((s, c) => s + c.planned, 0)
   const target = data.wedding.personalTotal > 0 ? data.wedding.personalTotal : categoriesTotal
-  const totalPaid = categories.reduce((s, c) => s + c.paid, 0)
-  const balances = accountBalances(data, today)
-  const saved = balances.filter((b) => b.purpose === 'wedding').reduce((s, b) => s + b.balance, 0)
-  const funded = saved + totalPaid
-  const remainingToSave = Math.max(0, target - funded)
-  const unlinkedWeddingSpend = data.transactions
-    .filter((t) => t.type === 'expense' && t.category === 'Wedding expenses' && !t.weddingCategoryId && isPosted(t, today))
-    .reduce((s, t) => s + t.amount, 0)
+  const paid = categories.reduce((s, c) => s + c.paid, 0)
+  const saved = accountBalances(data, today).filter((b) => b.purpose === 'wedding').reduce((s, b) => s + b.balance, 0)
+  const funded = saved + paid
   return {
     target,
     categoriesTotal,
     categories,
-    paid: totalPaid,
-    remainingBudget: Math.max(0, target - totalPaid),
+    paid,
+    unpaidCommitments: categories.reduce((s, c) => s + c.remaining, 0),
+    remainingBudget: Math.max(0, target - paid),
     saved,
     funded,
-    remainingToSave,
-    progress: target > 0 ? Math.min(100, (funded / target) * 100) : 0,
-    unlinkedWeddingSpend,
+    remainingToSave: Math.max(0, target - funded),
+    budgetCompletion: target > 0 ? Math.min(100, (paid / target) * 100) : 0,
+    progress: target > 0 ? Math.min(100, Math.max(0, (funded / target) * 100)) : 0,
+    unlinkedWeddingSpend: data.transactions
+      .filter((t) => t.type === 'expense' && t.category === 'Wedding expenses' && !t.weddingCategoryId && isPosted(t, today))
+      .reduce((s, t) => s + t.amount, 0),
   }
 }
 
@@ -162,13 +226,33 @@ export function weddingContribution(data: AppData, month: MonthKey, today = toda
     }
     if (t.type === 'expense' && t.weddingCategoryId && !wedding.has(t.accountId)) total += t.amount
   }
+  for (const s of data.salaryRecords) if (salaryReceived(s, today) && monthKey(s.actualDate) === month && wedding.has(s.accountId)) total += s.actualAmount!
   return total
 }
 
-export function upcomingExpenses(data: AppData, wc: WeddingCalc, today = todayISO()) {
-  const scheduledOther = data.transactions
-    .filter((t) => t.type === 'expense' && !isPosted(t, today) && !t.weddingCategoryId)
-    .reduce((s, t) => s + t.amount, 0)
-  const weddingRemaining = wc.categories.reduce((s, c) => s + c.remaining, 0)
-  return { scheduledOther, weddingRemaining, total: scheduledOther + weddingRemaining }
+// ---------- Upcoming payments ----------
+
+export interface UpcomingPayment {
+  date: ISODate
+  label: string
+  amount: number
+  kind: 'wedding' | 'recurring' | 'scheduled'
+  route: string
+}
+
+export function upcomingPayments(data: AppData, wc: WeddingCalc, today = todayISO(), days = 45): UpcomingPayment[] {
+  const until = addDays(today, days)
+  const out: UpcomingPayment[] = []
+  for (const c of wc.categories) if (c.remaining > 0 && c.dueDate && c.dueDate <= until) out.push({ date: c.dueDate, label: `Wedding: ${c.name}`, amount: c.remaining, kind: 'wedding', route: '/wedding' })
+  for (const o of recurringOccurrences(data, monthKey(addDays(today, -31)), monthKey(until))) {
+    if (!o.posted && o.date <= until && o.date >= addDays(today, -31)) out.push({ date: o.date, label: o.item.description, amount: o.item.amount, kind: 'recurring', route: '/calendar' })
+  }
+  for (const t of data.transactions) if (t.type === 'expense' && t.date > today && t.date <= until) out.push({ date: t.date, label: t.description || t.category, amount: t.amount, kind: 'scheduled', route: '/money' })
+  return out.sort((a, b) => (a.date < b.date ? -1 : 1))
+}
+
+/** Total of all unpaid commitments: wedding balances + scheduled expenses (any date). */
+export function totalUpcoming(data: AppData, wc: WeddingCalc, today = todayISO()) {
+  const scheduled = data.transactions.filter((t) => t.type === 'expense' && t.date > today && !t.weddingCategoryId).reduce((s, t) => s + t.amount, 0)
+  return { wedding: wc.unpaidCommitments, scheduled, total: wc.unpaidCommitments + scheduled }
 }

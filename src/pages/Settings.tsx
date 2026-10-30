@@ -1,36 +1,39 @@
 import { useRef, useState } from 'react'
+import { Pencil, Trash2 } from 'lucide-react'
 import { usePlanner } from '../lib/usePlanner'
 import { normalizeData, useStore, useUpdate } from '../lib/store'
-import { fmtDate } from '../lib/dates'
+import { fmtDate, fmtMonth } from '../lib/dates'
 import { money, uid } from '../lib/format'
 import { downloadCSV, downloadFile } from '../lib/csv'
 import { countLeaveDays } from '../lib/calc/leave'
-import type { Account, AccountPurpose } from '../lib/types'
+import { cloudEnabled, signOut, useCloud } from '../lib/cloud/sync'
+import { LEAVE_LABEL, type Account, type AccountPurpose } from '../lib/types'
 import { Alert, Badge, Button, Card, DateField, Modal, NumberField, PageHeader, SelectField, TextField } from '../components/ui'
 import { NotificationSettings } from '../components/Reminders'
 
 export default function Settings() {
-  const { data, today, balances } = usePlanner()
+  const { data, today, balances, wedding } = usePlanner()
   const update = useUpdate()
   const replace = useStore((s) => s.replace)
   const reset = useStore((s) => s.reset)
   const lastSaved = useStore((s) => s.lastSaved)
+  const user = useCloud((s) => s.user)
   const [acc, setAcc] = useState<Account | null>(null)
   const [msg, setMsg] = useState<{ level: 'ok' | 'danger'; text: string } | null>(null)
   const [resetOpen, setResetOpen] = useState(false)
   const [resetText, setResetText] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
+  const accName = (id: string) => data.accounts.find((a) => a.id === id)?.name ?? ''
 
   const backup = () => {
     downloadFile(`life-planner-backup-${today}.json`, JSON.stringify(data, null, 2), 'application/json')
     setMsg({ level: 'ok', text: 'Backup downloaded. Keep it somewhere safe, such as Google Drive.' })
   }
-
   const restore = async (file: File) => {
     try {
       if (file.size > 5_000_000) throw new Error('The file is too large to be a planner backup.')
       const parsed = normalizeData(JSON.parse(await file.text()))
-      if (!confirm(`Restore this backup? It has ${parsed.transactions.length} transactions and ${parsed.leaves.length} leave records. Your current data will be replaced.`)) return
+      if (!confirm(`Restore this backup? It has ${parsed.transactions.length} transactions, ${parsed.salaryRecords.length} salary records and ${parsed.leaves.length} leave records. Your current data will be replaced${cloudEnabled ? ' in your account' : ''}.`)) return
       replace(parsed)
       setMsg({ level: 'ok', text: 'Backup restored.' })
     } catch (e) {
@@ -40,12 +43,9 @@ export default function Settings() {
     }
   }
 
-  const accName = (id: string) => data.accounts.find((a) => a.id === id)?.name ?? ''
-
   return (
     <div className="space-y-6">
       <PageHeader title="Settings" subtitle="Your details, accounts, reminders and data." />
-
       {msg && <Alert level={msg.level}>{msg.text}</Alert>}
 
       <div className="grid gap-6 lg:grid-cols-2">
@@ -53,43 +53,31 @@ export default function Settings() {
           <div className="grid gap-4 sm:grid-cols-2">
             <TextField label="Your name" value={data.profile.name} onChange={(v) => update((d) => { d.profile.name = v })} autoComplete="given-name" />
             <DateField label="Wedding date" value={data.profile.weddingDate} onChange={(v) => v && update((d) => { d.profile.weddingDate = v })} required />
-          </div>
-        </Card>
-
-        <Card title="Money settings">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <NumberField label="Salary payment day" value={data.finance.salaryPayDay} onChange={(v) => update((d) => { d.finance.salaryPayDay = v })} min={1} max={31} allowDecimal={false} hint="Day of the month. Currency: Indian rupees (₹)." />
             <NumberField label="Monthly budget review day" value={data.finance.budgetReviewDay} onChange={(v) => update((d) => { d.finance.budgetReviewDay = v })} min={1} max={31} allowDecimal={false} />
           </div>
+          <p className="mt-3 text-xs text-slate-500">Currency: Indian rupees (₹). Employment and salary details are in Job & Employment.</p>
         </Card>
+        <Card title="Reminders and notifications"><NotificationSettings /></Card>
       </div>
 
-      <Card title="Accounts and opening balances" subtitle="Balances are worked out from the opening balance plus your transactions. Wedding and emergency accounts are kept separate in calculations." action={<Button size="sm" onClick={() => setAcc({ id: '', name: '', purpose: 'general', openingBalance: 0 })}>Add account</Button>}>
+      <Card title="Accounts and opening balances" subtitle="Balances = opening balance + salary received + transactions. Wedding and emergency accounts are kept separate." action={<Button size="sm" onClick={() => setAcc({ id: '', name: '', purpose: 'general', openingBalance: 0 })}>Add account</Button>}>
         <ul className="divide-y divide-cream-200">
           {data.accounts.map((a) => {
-            const used = data.transactions.filter((t) => t.accountId === a.id || t.toAccountId === a.id).length
+            const used = data.transactions.filter((t) => t.accountId === a.id || t.toAccountId === a.id).length + data.salaryRecords.filter((s) => s.accountId === a.id).length + data.recurring.filter((r) => r.accountId === a.id || r.toAccountId === a.id).length
             const bal = balances.find((b) => b.id === a.id)?.balance ?? 0
             return (
               <li key={a.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm">
                 <div>
                   <div className="flex items-center gap-2 font-medium text-navy-900">{a.name} <Badge tone={a.purpose === 'wedding' ? 'gold' : a.purpose === 'emergency' ? 'navy' : 'slate'}>{a.purpose === 'general' ? 'Everyday' : a.purpose === 'wedding' ? 'Wedding savings' : 'Emergency'}</Badge></div>
-                  <div className="text-xs text-slate-500">Opening {money(a.openingBalance)} · Now {money(bal)} · {used} transactions</div>
+                  <div className="text-xs text-slate-500">Opening {money(a.openingBalance, true)} · Now {money(bal, true)} · {used} linked record(s)</div>
                 </div>
                 <div>
-                  <Button size="sm" variant="ghost" onClick={() => setAcc(a)} aria-label={`Edit ${a.name}`}>Edit</Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="text-red-700"
-                    aria-label={`Delete ${a.name}`}
-                    onClick={() => {
-                      if (used > 0) return alert(`"${a.name}" has ${used} transactions. Move or delete them first.`)
-                      if (data.accounts.length <= 1) return alert('You need at least one account.')
-                      if (confirm(`Delete "${a.name}"?`)) update((d) => { d.accounts = d.accounts.filter((x) => x.id !== a.id) })
-                    }}
-                  >
-                    Delete
-                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setAcc(a)} aria-label={`Edit ${a.name}`}><Pencil className="h-3.5 w-3.5" aria-hidden /></Button>
+                  <Button size="sm" variant="ghost" className="text-red-700" aria-label={`Delete ${a.name}`} onClick={() => {
+                    if (used > 0) return alert(`"${a.name}" has ${used} linked record(s). Move or delete them first.`)
+                    if (data.accounts.length <= 1) return alert('You need at least one account.')
+                    if (confirm(`Delete the account "${a.name}"?`)) update((d) => { d.accounts = d.accounts.filter((x) => x.id !== a.id) })
+                  }}><Trash2 className="h-3.5 w-3.5" aria-hidden /></Button>
                 </div>
               </li>
             )
@@ -97,15 +85,11 @@ export default function Settings() {
         </ul>
       </Card>
 
-      <Card title="Reminders and notifications">
-        <NotificationSettings />
-      </Card>
-
-      <Card title="Your data" subtitle={<>Stored privately in this browser on this device only. Nothing is sent to a server.{lastSaved && <> Last saved {new Date(lastSaved).toLocaleTimeString('en-IN')}.</>}</>}>
+      <Card title="Your data" subtitle={cloudEnabled ? <>Stored in your private Supabase account{user ? ` (${user.email})` : ''}. Only you can read it — every table is protected by row-level security.</> : <>Stored privately in this browser on this device only.{lastSaved && <> Last saved {new Date(lastSaved).toLocaleTimeString('en-IN')}.</>}</>}>
         <div className="space-y-5">
           <div>
             <h3 className="text-sm font-semibold text-navy-900">Backup and restore</h3>
-            <p className="mb-2 text-sm text-slate-600">Clearing your browser data deletes everything. Download a backup regularly, and use it to move your data to another device.</p>
+            <p className="mb-2 text-sm text-slate-600">{cloudEnabled ? 'Download a copy of everything for safekeeping.' : 'Clearing your browser data deletes everything. Download a backup regularly; use it to move your data to another device.'}</p>
             <div className="flex flex-wrap gap-2">
               <Button onClick={backup}>Download backup (.json)</Button>
               <Button variant="secondary" onClick={() => fileRef.current?.click()}>Restore from backup</Button>
@@ -113,15 +97,26 @@ export default function Settings() {
             </div>
           </div>
           <div>
-            <h3 className="text-sm font-semibold text-navy-900">Export to CSV</h3>
+            <h3 className="text-sm font-semibold text-navy-900">Export to CSV (opens in Excel or Google Sheets)</h3>
             <div className="mt-2 flex flex-wrap gap-2">
-              <Button variant="secondary" disabled={!data.transactions.length} onClick={() => downloadCSV(`transactions-${today}.csv`, ['Date', 'Type', 'Category', 'Amount (INR)', 'Account', 'To account', 'Notes'], data.transactions.map((t) => [t.date, t.type, t.category, t.amount, accName(t.accountId), accName(t.toAccountId), t.notes]))}>Transactions</Button>
-              <Button variant="secondary" disabled={!data.leaves.length} onClick={() => downloadCSV(`leave-records-${today}.csv`, ['Start', 'End', 'Type', 'Status', 'Working days', 'For wedding', 'Notes'], data.leaves.map((l) => [l.startDate, l.endDate, l.type, l.status, countLeaveDays(l, data.leavePolicy), l.forWedding ? 'Yes' : 'No', l.notes]))}>Leave records</Button>
+              <Button variant="secondary" disabled={!data.transactions.length && !data.salaryRecords.length} onClick={() => downloadCSV(`money-${today}.csv`, ['Date', 'Type', 'Category', 'Description', 'Amount (INR)', 'Payment method', 'Account', 'To account', 'Notes'], [
+                ...data.salaryRecords.filter((s) => s.actualAmount !== null).map((s) => [s.actualDate, 'income', 'Salary', `Salary paid ${fmtMonth(s.payMonth)}`, s.actualAmount, 'Bank transfer', accName(s.accountId), '', s.notes]),
+                ...data.transactions.map((t) => [t.date, t.type === 'transfer' ? 'savings / transfer' : t.type, t.type === 'transfer' ? 'Savings' : t.category, t.description, t.amount, t.paymentMethod, accName(t.accountId), accName(t.toAccountId), t.notes]),
+              ])}>Income & expenses</Button>
+              <Button variant="secondary" disabled={!data.leaves.length} onClick={() => downloadCSV(`leave-${today}.csv`, ['Leave type', 'Start', 'End', 'Days', 'Status', 'Reason', 'For wedding', 'Notes'], data.leaves.map((l) => [LEAVE_LABEL[l.type], l.startDate, l.endDate, countLeaveDays(l, data.leavePolicy), l.status, l.reason, l.forWedding ? 'Yes' : 'No', l.notes]))}>Leave</Button>
+              <Button variant="secondary" onClick={() => downloadCSV(`wedding-budget-${today}.csv`, ['Category', 'Planned (INR)', 'Paid (INR)', 'Remaining (INR)', 'Due date', 'Status', 'Notes'], wedding.categories.map((c) => [c.name, c.planned, c.paid, c.remaining, c.dueDate, c.status, c.notes]))}>Wedding budget</Button>
             </div>
           </div>
+          {cloudEnabled && user && (
+            <div>
+              <h3 className="text-sm font-semibold text-navy-900">Account</h3>
+              <Button className="mt-2" variant="secondary" onClick={() => void signOut()}>Sign out</Button>
+              <p className="mt-1 text-xs text-slate-500">Signing out removes the copy kept on this device.</p>
+            </div>
+          )}
           <div className="rounded-xl border border-red-200 p-4">
             <h3 className="text-sm font-semibold text-red-800">Reset all data</h3>
-            <p className="mb-2 text-sm text-slate-600">Deletes everything in this planner on this device. Download a backup first.</p>
+            <p className="mb-2 text-sm text-slate-600">Deletes all your records and restores the starting details from your Employment Agreement. Download a backup first.</p>
             <Button variant="danger" onClick={() => setResetOpen(true)}>Reset planner</Button>
           </div>
         </div>
@@ -130,7 +125,7 @@ export default function Settings() {
       <p className="text-center text-xs text-slate-400">My Life Planner 2027 · Today: {fmtDate(today, true)}</p>
 
       {acc && <AccountModal acc={acc} onClose={() => setAcc(null)} />}
-      <Modal open={resetOpen} title="Reset all data?" onClose={() => { setResetOpen(false); setResetText('') }} footer={<><Button variant="secondary" onClick={() => { setResetOpen(false); setResetText('') }}>Cancel</Button><Button variant="danger" disabled={resetText !== 'RESET'} onClick={() => { reset(); setResetOpen(false); setResetText(''); setMsg({ level: 'ok', text: 'Planner reset to defaults.' }) }}>Delete everything</Button></>}>
+      <Modal open={resetOpen} title="Reset all data?" onClose={() => { setResetOpen(false); setResetText('') }} footer={<><Button variant="secondary" onClick={() => { setResetOpen(false); setResetText('') }}>Cancel</Button><Button variant="danger" disabled={resetText !== 'RESET'} onClick={() => { reset(); setResetOpen(false); setResetText(''); setMsg({ level: 'ok', text: 'Planner reset.' }) }}>Delete everything</Button></>}>
         <p className="mb-3 text-sm">This cannot be undone. Type <strong>RESET</strong> to confirm.</p>
         <TextField label="Confirmation" value={resetText} onChange={setResetText} />
       </Modal>
@@ -145,9 +140,9 @@ function AccountModal({ acc, onClose }: { acc: Account; onClose: () => void }) {
   const save = () => {
     if (!a.name.trim()) return setErr('Enter an account name.')
     update((d) => {
-      const clean = { ...a, name: a.name.trim() }
-      if (clean.id) d.accounts = d.accounts.map((x) => (x.id === clean.id ? clean : x))
-      else d.accounts.push({ ...clean, id: uid() })
+      const out = { ...a, name: a.name.trim() }
+      if (out.id) d.accounts = d.accounts.map((x) => (x.id === out.id ? out : x))
+      else d.accounts.push({ ...out, id: uid() })
     })
     onClose()
   }
